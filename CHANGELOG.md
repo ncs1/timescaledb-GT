@@ -4,7 +4,22 @@
 `psql` with the `-X` flag to prevent any `.psqlrc` commands from
 accidentally triggering the load of a previous DB version.**
 
-## 1.7.0 (unreleased)
+## 1.7.0 (2020-04-16)
+
+This release adds major new features and bugfixes since the 1.6.1 release.
+We deem it moderate priority for upgrading.
+
+This release adds the long-awaited support for PostgreSQL 12 to TimescaleDB.
+
+This release also adds a new default behavior when querying continuous
+aggregates that we call real-time aggregation. A query on a continuous
+aggregate will now combine materialized data with recent data that has
+yet to be materialized.
+Note that only newly created continuous aggregates will have this
+real-time query behavior, although it can be enabled on existing
+continuous aggregates with a configuration setting as follows:
+
+ALTER VIEW continuous_view_name SET (timescaledb.materialized_only=false);
 
 **Major Features**
 * #1456 Add support for PostgreSQL 12
@@ -31,6 +46,7 @@ accidentally triggering the load of a previous DB version.**
 * @t0k4rt for reporting an issue with parallel chunk append plans
 * @alxndrdude for reporting an issue when trying to insert into compressed chunks
 * @Olernov for reporting and fixing an issue with show_chunks and drop_chunks for compressed hypertables
+* @mjb512 for reporting an issue with INSERTs in CTEs in cached plans
 
 ## 1.6.1 (2020-03-18)
 
