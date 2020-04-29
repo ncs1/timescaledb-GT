@@ -21,3 +21,4 @@ typedef.list
 /.vs
 /compile_commands.json
 /.DS_Store
+TimescaleDB.*
