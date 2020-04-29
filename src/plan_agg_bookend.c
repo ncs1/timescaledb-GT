@@ -32,31 +32,39 @@
  *
  *
  */
-#include "postgres.h"
+#include <postgres.h>
 
-#include "access/htup_details.h"
-#include "catalog/pg_aggregate.h"
-#include "catalog/pg_type.h"
-#include "nodes/makefuncs.h"
-#include "nodes/nodeFuncs.h"
-#include "optimizer/clauses.h"
-#include "optimizer/cost.h"
-#include "optimizer/pathnode.h"
-#include "optimizer/paths.h"
-#include "optimizer/planmain.h"
-#include "optimizer/subselect.h"
-#include "optimizer/tlist.h"
-#include "parser/parsetree.h"
-#include "parser/parse_clause.h"
-#include "parser/parse_func.h"
-#include "rewrite/rewriteManip.h"
-#include "utils/lsyscache.h"
-#include "utils/syscache.h"
-#include "catalog/pg_proc.h"
+#include <access/htup_details.h>
+#include <access/stratnum.h>
 #include <catalog/namespace.h>
-#include "utils/typcache.h"
-#include "access/stratnum.h"
+#include <catalog/pg_aggregate.h>
+#include <catalog/pg_proc.h>
+#include <catalog/pg_type.h>
+#include <nodes/makefuncs.h>
+#include <nodes/nodeFuncs.h>
+#include <optimizer/cost.h>
+#include <optimizer/pathnode.h>
+#include <optimizer/paths.h>
+#include <optimizer/planmain.h>
+#include <optimizer/subselect.h>
+#include <optimizer/tlist.h>
+#include <parser/parsetree.h>
+#include <parser/parse_clause.h>
+#include <parser/parse_func.h>
+#include <rewrite/rewriteManip.h>
+#include <utils/lsyscache.h>
+#include <utils/syscache.h>
+#include <utils/typcache.h>
+
+#include "compat.h"
+#if PG12_LT
+#include <optimizer/clauses.h>
+#else
+#include <optimizer/optimizer.h>
+#endif
+
 #include "plan_agg_bookend.h"
+#include "planner.h"
 #include "utils.h"
 #include "extension.h"
 
@@ -222,7 +230,7 @@ contains_first_last_node(List *sortClause, List *targetList)
  *  - generate FirstLastAggInfo that wraps MinMaxAggInfo
  *  - generate subquery (path) for FIRST/LAST (we reuse MinMaxAggPath)
  *  - replace Aggref node with Param node
- * 	- reject ORDER BY on FIRST/LAST
+ *	- reject ORDER BY on FIRST/LAST
  */
 void
 ts_preprocess_first_last_aggregates(PlannerInfo *root, List *tlist)
@@ -531,7 +539,7 @@ find_first_last_aggs_walker(Node *node, List **context)
  *		Given a FIRST/LAST aggregate, try to build an indexscan Path it can be
  *		optimized with.
  *		We will generate subquery with value and sort target, where we
- * 	    SELECT value and we ORDER BY sort.
+ *		SELECT value and we ORDER BY sort.
  *
  * If successful, stash the best path in *mminfo and return TRUE.
  * Otherwise, return FALSE.
@@ -651,8 +659,76 @@ build_first_last_path(PlannerInfo *root, FirstLastAggInfo *fl_info, Oid eqop, Oi
 	subroot->tuple_fraction = 1.0;
 	subroot->limit_tuples = 1.0;
 
-	final_rel = query_planner(subroot, tlist, first_last_qp_callback, NULL);
+#if PG12_GE
+	{
+		ListCell *lc;
+		/* min/max optimizations ususally happen before
+		 * inheritance-relations are expanded, and thus query_planner will
+		 * try to expand our hypertables if they are marked as
+		 * inheritance-relations. Since we do not want this, we must mark
+		 * hypertabls as non-inheritance now.
+		 */
+		foreach (lc, subroot->parse->rtable)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
 
+			if (ts_rte_is_hypertable(rte))
+			{
+				ListCell *prev = NULL;
+				ListCell *next = list_head(subroot->append_rel_list);
+				Assert(rte->inh);
+				rte->inh = false;
+				/* query planner gets confused when entries in the
+				 * append_rel_list refer to entreis in the relarray that
+				 * don't exist. Since we need to rexpand hypertables in the
+				 * subquery, all of the chunk entries will be invalid in
+				 * this manner, so we remove them from the list
+				 */
+				/* TODO this can be made non-quadratic by storing all the
+				 *      relids in a bitset, then iterating over the
+				 *      append_rel_list once
+				 */
+				while (next != NULL)
+				{
+					AppendRelInfo *app = lfirst(next);
+					if (app->parent_reloid == rte->relid)
+					{
+						subroot->append_rel_list =
+							list_delete_cell(subroot->append_rel_list, next, prev);
+						next = prev != NULL ? prev->next : list_head(subroot->append_rel_list);
+					}
+					else
+					{
+						prev = next;
+						next = next->next;
+					}
+				}
+			}
+		}
+	}
+#endif
+
+	final_rel = query_planner(subroot,
+#if PG12_LT
+							  /* as of 333ed24 uses subroot->processed_tlist instead  */
+							  tlist,
+#endif
+							  first_last_qp_callback,
+							  NULL);
+
+#if PG12_GE
+	{
+		ListCell *lc;
+		/* we need to disable inheritance so the chunks are re-expanded correctly in the subroot */
+		foreach (lc, root->parse->rtable)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+			if (ts_rte_is_hypertable(rte))
+				rte->inh = true;
+		}
+	}
+#endif
 	/*
 	 * Since we didn't go through subquery_planner() to handle the subquery,
 	 * we have to do some of the same cleanup it would do, in particular cope

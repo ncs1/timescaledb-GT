@@ -9,13 +9,9 @@
 #include <nodes/bitmapset.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
-#include <optimizer/clauses.h>
 #include <optimizer/cost.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/paths.h>
-#include <optimizer/restrictinfo.h>
-#include <optimizer/tlist.h>
-#include <optimizer/var.h>
 #include <parser/parsetree.h>
 #include <utils/builtins.h>
 #include <utils/lsyscache.h>
@@ -23,9 +19,17 @@
 #include <miscadmin.h>
 
 #include "compat.h"
-#include "chunk.h"
-#include "hypertable.h"
+#if PG12_LT
+#include <optimizer/clauses.h>
+#include <optimizer/restrictinfo.h>
+#include <optimizer/tlist.h>
+#include <optimizer/var.h>
+#else
+#include <optimizer/optimizer.h>
+#endif
+
 #include "hypertable_compression.h"
+#include "import/planner.h"
 #include "compression/create.h"
 #include "nodes/decompress_chunk/decompress_chunk.h"
 #include "nodes/decompress_chunk/planner.h"
@@ -876,7 +880,7 @@ decompress_chunk_add_plannerinfo(PlannerInfo *root, CompressionInfo *info, Chunk
 {
 	ListCell *lc;
 	Index compressed_index = root->simple_rel_array_size;
-	Chunk *compressed_chunk = ts_chunk_get_by_id(chunk->fd.compressed_chunk_id, 0, true);
+	Chunk *compressed_chunk = ts_chunk_get_by_id(chunk->fd.compressed_chunk_id, true);
 	Oid compressed_relid = compressed_chunk->table_id;
 	RelOptInfo *compressed_rel;
 
@@ -1016,12 +1020,15 @@ static RangeTblEntry *
 decompress_chunk_make_rte(Oid compressed_relid, LOCKMODE lockmode)
 {
 	RangeTblEntry *rte = makeNode(RangeTblEntry);
-	Relation r = heap_open(compressed_relid, lockmode);
+	Relation r = table_open(compressed_relid, lockmode);
 	int varattno;
 
 	rte->rtekind = RTE_RELATION;
 	rte->relid = compressed_relid;
 	rte->relkind = r->rd_rel->relkind;
+#if PG12_GE
+	rte->rellockmode = lockmode;
+#endif
 	rte->eref = makeAlias(RelationGetRelationName(r), NULL);
 
 	/*
@@ -1048,7 +1055,7 @@ decompress_chunk_make_rte(Oid compressed_relid, LOCKMODE lockmode)
 	 * so that the table can't be deleted or have its schema modified
 	 * underneath us.
 	 */
-	heap_close(r, NoLock);
+	table_close(r, NoLock);
 
 	/*
 	 * Set flags and access permissions.

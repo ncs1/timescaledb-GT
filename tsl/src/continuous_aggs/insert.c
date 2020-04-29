@@ -1,4 +1,3 @@
-
 /*
  * This file and its contents are licensed under the Timescale License.
  * Please see the included NOTICE for copyright information and
@@ -22,6 +21,8 @@
 #include <scanner.h>
 #include <interval.h>
 #include <continuous_agg.h>
+
+#include "compat.h"
 
 #include "chunk.h"
 #include "dimension.h"
@@ -113,7 +114,10 @@ tuple_get_time(Dimension *d, HeapTuple tuple, AttrNumber col, TupleDesc tupdesc)
 	datum = heap_getattr(tuple, col, tupdesc, &isnull);
 
 	if (NULL != d->partitioning)
-		datum = ts_partitioning_func_apply(d->partitioning, datum);
+	{
+		Oid collation = TupleDescAttr(tupdesc, col)->attcollation;
+		datum = ts_partitioning_func_apply(d->partitioning, collation, datum);
+	}
 
 	Assert(d->type == DIMENSION_TYPE_OPEN);
 
@@ -164,7 +168,7 @@ static inline void
 cache_entry_switch_to_chunk(ContinuousAggsCacheInvalEntry *cache_entry, Oid chunk_id,
 							Relation chunk_relation)
 {
-	Chunk *modified_tuple_chunk = ts_chunk_get_by_relid(chunk_id, 0, false);
+	Chunk *modified_tuple_chunk = ts_chunk_get_by_relid(chunk_id, false);
 	if (modified_tuple_chunk == NULL)
 		elog(ERROR, "continuous agg trigger function must be called on hypertable chunks only");
 
@@ -417,8 +421,8 @@ append_invalidation_entry(ContinuousAggsCacheInvalEntry *entry)
 
 	Assert(entry->lowest_modified_value <= entry->greatest_modified_value);
 
-	rel = heap_open(catalog_get_table_id(catalog, CONTINUOUS_AGGS_HYPERTABLE_INVALIDATION_LOG),
-					RowExclusiveLock);
+	rel = table_open(catalog_get_table_id(catalog, CONTINUOUS_AGGS_HYPERTABLE_INVALIDATION_LOG),
+					 RowExclusiveLock);
 	desc = RelationGetDescr(rel);
 
 	values[AttrNumberGetAttrOffset(
@@ -441,5 +445,5 @@ append_invalidation_entry(ContinuousAggsCacheInvalEntry *entry)
 	/* Lock will be released by the transaction end. Since this is called on the
 	 * commit hook, this should be soon.
 	 */
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 }

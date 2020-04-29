@@ -3,6 +3,7 @@
  * Please see the included NOTICE for copyright information and
  * LICENSE-APACHE for a copy of the license.
  */
+#include "c.h"
 #include <postgres.h>
 #include <utils/hsearch.h>
 #include <utils/relcache.h>
@@ -17,11 +18,12 @@
 #include <commands/tablecmds.h>
 #include <catalog/dependency.h>
 #include <funcapi.h>
+
 #include <nodes/makefuncs.h>
 
 #include <catalog/pg_constraint.h>
 #include "compat.h"
-#if PG96 || PG10 /* PG11 consolidates pg_foo_fn.h -> pg_foo.h */
+#if PG11_LT /* PG11 consolidates pg_foo_fn.h -> pg_foo.h */
 #include <catalog/pg_constraint_fn.h>
 #endif
 
@@ -177,7 +179,7 @@ chunk_constraint_insert_relation(Relation rel, ChunkConstraint *cc)
 /*
  * Insert multiple chunk constraints into the metadata catalog.
  */
-TSDLLEXPORT void
+void
 ts_chunk_constraints_insert_metadata(ChunkConstraints *ccs)
 {
 	Catalog *catalog = ts_catalog_get();
@@ -185,7 +187,7 @@ ts_chunk_constraints_insert_metadata(ChunkConstraints *ccs)
 	Relation rel;
 	int i;
 
-	rel = heap_open(catalog_get_table_id(catalog, CHUNK_CONSTRAINT), RowExclusiveLock);
+	rel = table_open(catalog_get_table_id(catalog, CHUNK_CONSTRAINT), RowExclusiveLock);
 
 	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
 
@@ -193,7 +195,7 @@ ts_chunk_constraints_insert_metadata(ChunkConstraints *ccs)
 		chunk_constraint_insert_relation(rel, &ccs->constraints[i]);
 
 	ts_catalog_restore_user(&sec_ctx);
-	heap_close(rel, RowExclusiveLock);
+	table_close(rel, RowExclusiveLock);
 }
 
 /*
@@ -206,12 +208,12 @@ chunk_constraint_insert(ChunkConstraint *constraint)
 	CatalogSecurityContext sec_ctx;
 	Relation rel;
 
-	rel = heap_open(catalog_get_table_id(catalog, CHUNK_CONSTRAINT), RowExclusiveLock);
+	rel = table_open(catalog_get_table_id(catalog, CHUNK_CONSTRAINT), RowExclusiveLock);
 
 	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
 	chunk_constraint_insert_relation(rel, constraint);
 	ts_catalog_restore_user(&sec_ctx);
-	heap_close(rel, RowExclusiveLock);
+	table_close(rel, RowExclusiveLock);
 }
 
 static ChunkConstraint *
@@ -325,7 +327,7 @@ chunk_constraint_create(ChunkConstraint *cc, Oid chunk_oid, int32 chunk_id, Oid 
 /*
  * Create a set of constraints on a chunk table.
  */
-TSDLLEXPORT void
+void
 ts_chunk_constraints_create(ChunkConstraints *ccs, Oid chunk_oid, int32 chunk_id,
 							Oid hypertable_oid, int32 hypertable_id)
 {
@@ -572,7 +574,7 @@ ts_chunk_constraints_add_dimension_constraints(ChunkConstraints *ccs, int32 chun
 	return cube->num_slices;
 }
 
-TSDLLEXPORT int
+int
 ts_chunk_constraints_add_inheritable_constraints(ChunkConstraints *ccs, int32 chunk_id,
 												 Oid hypertable_oid)
 {
@@ -584,7 +586,7 @@ ts_chunk_constraints_add_inheritable_constraints(ChunkConstraints *ccs, int32 ch
 
 	ScanKeyInit(&skey, Anum_pg_constraint_conrelid, BTEqualStrategyNumber, F_OIDEQ, hypertable_oid);
 
-	rel = heap_open(ConstraintRelationId, AccessShareLock);
+	rel = table_open(ConstraintRelationId, AccessShareLock);
 	scan = systable_beginscan(rel, ConstraintRelidTypidNameIndexId, true, NULL, 1, &skey);
 
 	while (HeapTupleIsValid(htup = systable_getnext(scan)))
@@ -599,7 +601,7 @@ ts_chunk_constraints_add_inheritable_constraints(ChunkConstraints *ccs, int32 ch
 	}
 
 	systable_endscan(scan);
-	heap_close(rel, AccessShareLock);
+	table_close(rel, AccessShareLock);
 
 	return num_added;
 }
@@ -651,17 +653,23 @@ chunk_constraint_delete_metadata(TupleInfo *ti)
 		heap_getattr(ti->tuple, Anum_chunk_constraint_constraint_name, ti->desc, &isnull);
 	int32 chunk_id =
 		DatumGetInt32(heap_getattr(ti->tuple, Anum_chunk_constraint_chunk_id, ti->desc, &isnull));
-	Chunk *chunk = ts_chunk_get_by_id(chunk_id, 0, true);
-	Oid index_relid = get_constraint_index(
-		get_relation_constraint_oid(chunk->table_id, NameStr(*DatumGetName(constrname)), true));
+	/* Get the chunk relid. Note that, at this point, the chunk table can be
+	 * deleted already */
+	Oid chunk_relid = ts_chunk_get_relid(chunk_id, true);
 
-	/*
-	 * If this is an index constraint, we need to cleanup the index
-	 * metadata. Don't drop the index though, since that will happend when
-	 * the constraint is dropped.
-	 */
-	if (OidIsValid(index_relid))
-		ts_chunk_index_delete(chunk, index_relid, false);
+	if (OidIsValid(chunk_relid))
+	{
+		Oid index_relid = get_constraint_index(
+			get_relation_constraint_oid(chunk_relid, NameStr(*DatumGetName(constrname)), true));
+
+		/*
+		 * If this is an index constraint, we need to cleanup the index
+		 * metadata. Don't drop the index though, since that will happend when
+		 * the constraint is dropped.
+		 */
+		if (OidIsValid(index_relid))
+			ts_chunk_index_delete(chunk_id, get_rel_name(index_relid), false);
+	}
 
 	ts_catalog_delete(ti->scanrel, ti->tuple);
 }
@@ -674,15 +682,21 @@ chunk_constraint_drop_constraint(TupleInfo *ti)
 		heap_getattr(ti->tuple, Anum_chunk_constraint_constraint_name, ti->desc, &isnull);
 	int32 chunk_id =
 		DatumGetInt32(heap_getattr(ti->tuple, Anum_chunk_constraint_chunk_id, ti->desc, &isnull));
-	Chunk *chunk = ts_chunk_get_by_id(chunk_id, 0, true);
-	ObjectAddress constrobj = {
-		.classId = ConstraintRelationId,
-		.objectId =
-			get_relation_constraint_oid(chunk->table_id, NameStr(*DatumGetName(constrname)), true),
-	};
+	/* Get the chunk relid. Note that, at this point, the chunk table can be
+	 * deleted already. */
+	Oid chunk_relid = ts_chunk_get_relid(chunk_id, true);
 
-	if (OidIsValid(constrobj.objectId))
-		performDeletion(&constrobj, DROP_RESTRICT, 0);
+	if (OidIsValid(chunk_relid))
+	{
+		ObjectAddress constrobj = {
+			.classId = ConstraintRelationId,
+			.objectId =
+				get_relation_constraint_oid(chunk_relid, NameStr(*DatumGetName(constrname)), true),
+		};
+
+		if (OidIsValid(constrobj.objectId))
+			performDeletion(&constrobj, DROP_RESTRICT, 0);
+	}
 }
 
 int
@@ -786,14 +800,15 @@ ts_chunk_constraint_recreate(ChunkConstraint *cc, Oid chunk_oid)
 }
 
 static void
-chunk_constraint_rename_on_chunk_table(int32 chunk_id, char *old_name, char *new_name)
+chunk_constraint_rename_on_chunk_table(int32 chunk_id, const char *old_name, const char *new_name)
 {
-	Chunk *chunk = ts_chunk_get_by_id(chunk_id, 0, true);
+	Oid chunk_relid = ts_chunk_get_relid(chunk_id, false);
+	Oid nspid = get_rel_namespace(chunk_relid);
 	RenameStmt rename = {
 		.renameType = OBJECT_TABCONSTRAINT,
-		.relation = makeRangeVar(NameStr(chunk->fd.schema_name), NameStr(chunk->fd.table_name), 0),
-		.subname = old_name,
-		.newname = new_name,
+		.relation = makeRangeVar(get_namespace_name(nspid), get_rel_name(chunk_relid), 0),
+		.subname = pstrdup(old_name),
+		.newname = pstrdup(new_name),
 	};
 
 	RenameConstraint(&rename);
@@ -863,9 +878,9 @@ ts_chunk_constraint_get_name_from_hypertable_constraint(Oid chunk_relid,
 {
 	ScanIterator iterator =
 		ts_scan_iterator_create(CHUNK_CONSTRAINT, RowExclusiveLock, CurrentMemoryContext);
-	Chunk *chunk = ts_chunk_get_by_relid(chunk_relid, 0, true);
+	Datum chunk_id = DirectFunctionCall1(ts_chunk_id_from_relid, ObjectIdGetDatum(chunk_relid));
 
-	init_scan_by_chunk_id(&iterator, chunk->fd.id);
+	init_scan_by_chunk_id(&iterator, DatumGetInt32(chunk_id));
 	ts_scanner_foreach(&iterator)
 	{
 		bool nulls[Natts_chunk_constraint];

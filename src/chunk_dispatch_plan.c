@@ -4,6 +4,7 @@
  * LICENSE-APACHE for a copy of the license.
  */
 #include <postgres.h>
+#include <nodes/nodes.h>
 #include <nodes/extensible.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
@@ -71,12 +72,9 @@ chunk_dispatch_plan_create(PlannerInfo *root, RelOptInfo *relopt, CustomPath *be
 	cscan->custom_plans = custom_plans;
 	cscan->scan.scanrelid = 0; /* Indicate this is not a real relation we are
 								* scanning */
-	cscan->scan.plan.targetlist = tlist;
-
-	/*
-	 * We need to set a custom_scan_tlist for EXPLAIN (verbose).
-	 */
+	/* The "input" and "output" target lists should be the same */
 	cscan->custom_scan_tlist = tlist;
+	cscan->scan.plan.targetlist = tlist;
 
 	return &cscan->scan.plan;
 }

@@ -15,19 +15,28 @@
 #include <nodes/nodeFuncs.h>
 #include <nodes/nodes.h>
 #include <nodes/plannodes.h>
-#include <optimizer/clauses.h>
+#include <nodes/parsenodes.h>
 #include <optimizer/plancat.h>
-#include <optimizer/prep.h>
+#include <optimizer/cost.h>
 #include <parser/parsetree.h>
 #include <rewrite/rewriteManip.h>
 #include <utils/lsyscache.h>
 #include <utils/memutils.h>
 #include <utils/syscache.h>
 
+#include "compat.h"
+#if PG12_LT
+#include <optimizer/clauses.h>
+#include <optimizer/prep.h>
+#else
+#include <optimizer/appendinfo.h>
+#include <optimizer/optimizer.h>
+#endif
+
 #include "constraint_aware_append.h"
 #include "hypertable.h"
 #include "chunk_append/transform.h"
-#include "compat.h"
+#include "guc.h"
 
 /*
  * Exclude child relations (chunks) at execution time based on constraints.
@@ -54,18 +63,19 @@ static Plan *
 get_plans_for_exclusion(Plan *plan)
 {
 	/* Optimization: If we want to be able to prune */
-	/* when the node is a T_Result, then we need to peek */
+	/* when the node is a T_Result or T_Sort, then we need to peek */
 	/* into the subplans of this Result node. */
-	if (IsA(plan, Result))
-	{
-		Result *res = (Result *) plan;
 
-		if (res->plan.lefttree != NULL && res->plan.righttree == NULL)
-			return res->plan.lefttree;
-		if (res->plan.righttree != NULL && res->plan.lefttree == NULL)
-			return res->plan.righttree;
+	switch (nodeTag(plan))
+	{
+		case T_Result:
+		case T_Sort:
+			Assert(plan->lefttree != NULL && plan->righttree == NULL);
+			return plan->lefttree;
+
+		default:
+			return plan;
 	}
-	return plan;
 }
 
 static bool
@@ -134,6 +144,29 @@ ca_append_begin(CustomScanState *node, EState *estate, int eflags)
 		.glob = &glob,
 		.parse = &parse,
 	};
+
+#if PG12_GE
+	/* CustomScan hard-codes the scan and result tuple slot to a fixed
+	 * TTSOpsVirtual ops (meaning it expects the slot ops of the child tuple to
+	 * also have this type). Oddly, when reading slots from subscan nodes
+	 * (children), there is no knowing what tuple slot ops the child slot will
+	 * have (e.g., for ChunkAppend it is common that the child is a
+	 * seqscan/indexscan that produces a TTSOpsBufferHeapTuple
+	 * slot). Unfortunately, any mismatch between slot types when projecting is
+	 * asserted by PostgreSQL. To avoid this issue, we mark the scanops as
+	 * non-fixed and reinitialize the projection state with this new setting.
+	 *
+	 * Alternatively, we could copy the child tuple into the scan slot to get
+	 * the expected ops before projection, but this would require materializing
+	 * and copying the tuple unnecessarily.
+	 */
+	node->ss.ps.scanopsfixed = false;
+
+	/* Since we sometimes return the scan slot directly from the subnode, the
+	 * result slot is not fixed either. */
+	node->ss.ps.resultopsfixed = false;
+	ExecAssignScanProjectionInfoWithVarno(&node->ss, INDEX_VAR);
+#endif
 
 	switch (nodeTag(subplan))
 	{
@@ -228,7 +261,7 @@ ca_append_begin(CustomScanState *node, EState *estate, int eflags)
 				if (can_exclude_chunk(&root, estate, scanrelid, restrictinfos))
 					continue;
 
-				*appendplans = lappend(*appendplans, plan);
+				*appendplans = lappend(*appendplans, lfirst(lc_plan));
 				break;
 			}
 			default:
@@ -527,6 +560,48 @@ ts_constraint_aware_append_path_create(PlannerInfo *root, Hypertable *ht, Path *
 	return &path->cpath.path;
 }
 
+bool
+ts_constraint_aware_append_possible(Path *path)
+{
+	RelOptInfo *rel = path->parent;
+	ListCell *lc;
+	int num_children;
+
+	if (ts_guc_disable_optimizations || !ts_guc_constraint_aware_append ||
+		constraint_exclusion == CONSTRAINT_EXCLUSION_OFF)
+		return false;
+
+	switch (nodeTag(path))
+	{
+		case T_AppendPath:
+			num_children = list_length(castNode(AppendPath, path)->subpaths);
+			break;
+		case T_MergeAppendPath:
+			num_children = list_length(castNode(MergeAppendPath, path)->subpaths);
+			break;
+		default:
+			return false;
+	}
+
+	/* Never use constraint-aware append with only one child, since PG12 will
+	 * later prune the (Merge)Append node from such plans, leaving us with an
+	 * unexpected child node. */
+	if (num_children <= 1)
+		return false;
+
+	/*
+	 * If there are clauses that have mutable functions, this path is ripe for
+	 * execution-time optimization.
+	 */
+	foreach (lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+		if (contain_mutable_functions((Node *) rinfo->clause))
+			return true;
+	}
+	return false;
+}
 void
 _constraint_aware_append_init(void)
 {

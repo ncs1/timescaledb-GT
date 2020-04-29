@@ -8,6 +8,7 @@
 #include <fmgr.h>
 #include <miscadmin.h>
 #include <commands/extension.h>
+#include <catalog/pg_collation.h>
 #include <utils/builtins.h>
 #include <utils/json.h>
 #include <utils/jsonb.h>
@@ -142,17 +143,19 @@ ts_validate_server_version(const char *json, VersionResult *result)
  * called "current_timescaledb_version". Check this against the local
  * version, and notify the user if it is behind.
  */
-static void
-process_response(const char *json)
+void
+ts_check_version_response(const char *json)
 {
 	VersionResult result;
-	bool is_uptodate =
-		DatumGetBool(DirectFunctionCall2(texteq,
-										 DirectFunctionCall2(json_object_field_text,
-															 CStringGetTextDatum(json),
-															 PointerGetDatum(cstring_to_text(
-																 TS_IS_UPTODATE_JSON_FIELD))),
-										 PointerGetDatum(cstring_to_text("true"))));
+	bool is_uptodate = DatumGetBool(
+		DirectFunctionCall2Coll(texteq,
+								C_COLLATION_OID,
+								DirectFunctionCall2Coll(json_object_field_text,
+														C_COLLATION_OID,
+														CStringGetTextDatum(json),
+														PointerGetDatum(cstring_to_text(
+															TS_IS_UPTODATE_JSON_FIELD))),
+								PointerGetDatum(cstring_to_text("true"))));
 
 	if (is_uptodate)
 		elog(NOTICE, "the \"%s\" extension is up-to-date", EXTENSION_NAME);
@@ -500,6 +503,7 @@ ts_telemetry_main(const char *host, const char *path, const char *service)
 	HttpRequest *req;
 	HttpResponseState *rsp;
 	bool started = false;
+	const char *volatile json = NULL;
 
 	if (!ts_telemetry_on())
 		return true;
@@ -542,7 +546,26 @@ ts_telemetry_main(const char *host, const char *path, const char *service)
 	 * Do the version-check. Response is the body of a well-formed HTTP
 	 * response, since otherwise the previous line will throw an error.
 	 */
-	process_response(ts_http_response_state_body_start(rsp));
+	PG_TRY();
+	{
+		json = ts_http_response_state_body_start(rsp);
+		ts_check_version_response(json);
+	}
+	PG_CATCH();
+	{
+		/* If the response is malformed, ts_check_version_response() will
+		 * throw an error, so we capture the error here and print debugging
+		 * information before re-throwing the error. */
+		ereport(NOTICE,
+				(errmsg("malformed telemetry response body"),
+				 errdetail("host=%s, service=%s, path=%s: %s",
+						   host,
+						   service,
+						   path,
+						   json ? json : "<EMPTY>")));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	ts_http_response_state_destroy(rsp);
 

@@ -46,7 +46,6 @@ set(SOURCES
   plan_add_hashagg.c
   plan_agg_bookend.c
   plan_partialize.c
-  planner_import.c
   process_utility.c
   scanner.c
   scan_iterator.c
@@ -123,3 +122,5 @@ add_subdirectory(net)
 add_subdirectory(telemetry)
 add_subdirectory(loader)
 add_subdirectory(bgw_policy)
+add_subdirectory(compat)
+add_subdirectory(import)

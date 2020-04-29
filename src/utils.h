@@ -7,14 +7,10 @@
 #define TIMESCALEDB_UTILS_H
 
 #include <postgres.h>
-#include <fmgr.h>
 #include <access/htup_details.h>
 #include <catalog/pg_proc.h>
-#include <nodes/primnodes.h>
-#include <nodes/relation.h>
 #include <utils/datetime.h>
 
-#include "export.h"
 #include "compat.h"
 
 #if PG11_GE
@@ -78,7 +74,7 @@ extern Oid ts_lookup_proc_filtered(const char *schema, const char *funcname, Oid
 								   proc_filter filter, void *filter_arg);
 extern Oid ts_get_operator(const char *name, Oid namespace, Oid left, Oid right);
 
-extern Oid ts_get_cast_func(Oid source, Oid target);
+extern TSDLLEXPORT Oid ts_get_cast_func(Oid source, Oid target);
 
 extern void *ts_create_struct_from_tuple(HeapTuple tuple, MemoryContext mctx, size_t alloc_size,
 										 size_t copy_size);

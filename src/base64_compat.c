@@ -3,8 +3,6 @@
  * Please see the included NOTICE for copyright information and
  * LICENSE-APACHE for a copy of the license.
  */
-#include "compat.h"
-#if PG96
 
 /*
  * Copy of postgres's src/common/base64.c for use in PG 9.6
@@ -20,6 +18,7 @@
 #endif
 
 #include "base64_compat.h"
+#if PG96
 
 /*
  * BASE64

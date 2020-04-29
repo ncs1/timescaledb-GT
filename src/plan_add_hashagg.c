@@ -18,10 +18,10 @@
 #include "compat-msvc-exit.h"
 
 #include "plan_add_hashagg.h"
+#include "import/planner.h"
 #include "utils.h"
 #include "guc.h"
 #include "estimate.h"
-#include "compat.h"
 
 /* Add a parallel HashAggregate plan.
  * This code is similar to parts of create_grouping_paths */

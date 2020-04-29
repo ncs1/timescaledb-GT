@@ -8,11 +8,6 @@
 #define TIMESCALEDB_DECOMPRESS_CHUNK_EXEC_H
 
 #include <postgres.h>
-#include <nodes/bitmapset.h>
-#include <nodes/extensible.h>
-#include <nodes/relation.h>
-
-#include "compression/compression.h"
 
 #define DECOMPRESS_CHUNK_COUNT_ID -9
 #define DECOMPRESS_CHUNK_SEQUENCE_NUM_ID -10

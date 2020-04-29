@@ -14,7 +14,6 @@ function(GET_PG_CONFIG var)
       OUTPUT_STRIP_TRAILING_WHITESPACE)
   endif()
 
-  
   # On Windows, fields that are not recorded will be given the value
   # "not recorded", so we translate this into <var>-NOTFOUND to make
   # it undefined.
@@ -152,46 +151,24 @@ if (ENABLE_CODECOVERAGE)
 endif (ENABLE_CODECOVERAGE)
 
 # Search paths for Postgres binaries
-if (WIN32)
+if(WIN32)
   find_path(PG_PATH
-    bin/postgres
-    HINTS
-    "C:/PostgreSQL"
-    "C:/Program Files/PostgreSQL"
-    PATH_SUFFIXES
-    bin
-    10/bin
-    96/bin
-    pg96/bin
-    DOC
-    "The path to a PostgreSQL installation")
-endif (WIN32)
-
-if (UNIX)
+    postgres.exe
+    PATHS "C:/PostgreSQL" "C:/Program Files/PostgreSQL"
+    PATH_SUFFIXES bin 11/bin 10/bin 96/bin pg96/bin
+    DOC "The path to a PostgreSQL installation")
+elseif(UNIX)
   find_path(PG_PATH
-    bin/postgres
-    HINTS
-    $ENV{HOME}
-    /opt/local/pgsql
-    /usr/local/pgsql
-    /usr/lib/postgresql
-    PATH_SUFFIXES
-    bin
-    10/bin
-    9.6/bin
-    96/bin
-    pg96/bin
-    DOC
-    "The path to a PostgreSQL installation")
-endif (UNIX)
+    postgres
+    PATHS $ENV{HOME} /opt/local/pgsql /usr/local/pgsql /usr/lib/postgresql
+    PATH_SUFFIXES bin 11/bin 10/bin 9.6/bin 96/bin pg96/bin
+    DOC "The path to a PostgreSQL installation")
+endif()
 
 find_program(PG_CONFIG pg_config
-  HINTS
-  ${PG_PATH}
-  PATH_SUFFIXES
-  bin
-  DOC
-  "The path to the pg_config of the PostgreSQL version to compile against")
+  HINTS ${PG_PATH}
+  PATH_SUFFIXES bin
+  DOC "The path to the pg_config of the PostgreSQL version to compile against")
 
 if (NOT PG_CONFIG)
   message(FATAL_ERROR "Unable to find 'pg_config'")
@@ -223,11 +200,14 @@ endif ()
 
 message(STATUS "Compiling against PostgreSQL version ${PG_VERSION}")
 
-if ((${PG_VERSION} VERSION_LESS "9.6")
-    OR (${PG_VERSION} VERSION_EQUAL "12")
-    OR (${PG_VERSION} VERSION_GREATER "12"))
-  message(FATAL_ERROR "TimescaleDB only supports PostgreSQL 9.6, 10 or 11")
-endif ()
+# Ensure that PostgreSQL version is supported and consistent
+# with src/compat.h version check
+if ((${PG_VERSION_MAJOR} LESS "9") OR
+    (${PG_VERSION_MAJOR} EQUAL "9" AND ${PG_VERSION} VERSION_LESS "9.6.3") OR
+    (${PG_VERSION_MAJOR} EQUAL "10" AND ${PG_VERSION} VERSION_LESS "10.2") OR
+    (${PG_VERSION_MAJOR} GREATER "12"))
+  message(FATAL_ERROR "TimescaleDB only supports PostgreSQL 9.6.3+, 10.2+, 11 or 12")
+endif()
 
 # Get PostgreSQL configuration from pg_config
 get_pg_config(PG_INCLUDEDIR --includedir)
@@ -268,13 +248,25 @@ install(
   FILES ${CMAKE_CURRENT_BINARY_DIR}/${EXT_CONTROL_FILE}
   DESTINATION "${PG_SHAREDIR}/extension")
 
-find_program(CLANG_FORMAT clang-format DOC "The path to clang-format")
+# We look for specific versions installed by distributions before the
+# default name since distros that have installed clang-format-9 will
+# not work and the user need to install an earlier version, which will
+# then be named "clang-format-N".
+#
+# This breaks the CMake convention of using the "default" name first
+# to handle local installs. If this turns out to be something that we
+# want to support, we need to look specifically for "clang-format" in
+# the local installation paths before looking for the versioned names
+# in standard installation paths.
+find_program(CLANG_FORMAT
+  NAMES clang-format-8 clang-format-7 clang-format
+  DOC "The path to clang-format")
 
 if (CLANG_FORMAT)
   execute_process(
-  COMMAND ${CLANG_FORMAT} --version
-  OUTPUT_VARIABLE CLANG_FORMAT_VERSION_OUTPUT
-  OUTPUT_STRIP_TRAILING_WHITESPACE)
+    COMMAND ${CLANG_FORMAT} --version
+    OUTPUT_VARIABLE CLANG_FORMAT_VERSION_OUTPUT
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
 
   if (NOT ${CLANG_FORMAT_VERSION_OUTPUT} MATCHES "version[ ]+([0-9]+)\\.([0-9]+)(\\.([0-9]+))*")
     message(FATAL_ERROR "Could not parse clang-format version ${CLANG_FORMAT_VERSION_OUTPUT}")
@@ -294,7 +286,7 @@ if (NOT CLANG_FORMAT)
   else ()
     message(STATUS "Using docker based clang-format")
     add_custom_target(format
-      COMMAND docker run --rm -it -v ${PROJECT_SOURCE_DIR}:/timescaledb timescaledev/postgres-dev-clang:clang7-pg11.1 /timescaledb/scripts/clang_format_all.sh
+      COMMAND docker run --rm -it --user=`id -u`:`id -g` --volume=${PROJECT_SOURCE_DIR}:/timescaledb timescaledev/postgres-dev-clang:clang7-pg11.1 /timescaledb/scripts/clang_format_all.sh
     )
   endif()
 else()
@@ -304,6 +296,20 @@ else()
   )
 endif ()
 
+find_program(RUN_CLANG_TIDY run-clang-tidy DOC "The path to run-clang-tidy")
+
+if(RUN_CLANG_TIDY)
+  message(STATUS "Found clang-tidy at ${RUN_CLANG_TIDY}")
+  if(CMAKE_EXPORT_COMPILE_COMMANDS)
+    add_custom_target(clang-tidy COMMAND ${RUN_CLANG_TIDY} -quiet)
+  else()
+    message(WARNING "You need to add -DCMAKE_EXPORT_COMPILE_COMMANDS=ON to use clang-tidy")
+    add_custom_target(clang-tidy
+      COMMAND ${CMAKE_COMMAND} -E echo "clang-tidy found but -DCMAKE_EXPORT_COMPILE_COMMAND was not set")
+  endif()
+else()
+  message(WARNING "Did not find clang-tidy, not defining clang-tidy target.")
+endif()
 
 option(USE_OPENSSL "Enable use of OpenSSL if available" ON)
 option(SEND_TELEMETRY_DEFAULT "The default value for whether to send telemetry" ON)
@@ -324,7 +330,7 @@ endif (USE_OPENSSL AND (NOT PG_USE_OPENSSL))
 
 if (USE_OPENSSL)
   # Try to find a local OpenSSL installation
-  include(FindOpenSSL)
+  find_package(OpenSSL)
 
   if (NOT OPENSSL_FOUND)
     message(FATAL_ERROR "TimescaleDB requires OpenSSL but it wasn't found. If you want to continue without OpenSSL, re-run bootstrap with `-DUSE_OPENSSL=0`")
@@ -334,6 +340,18 @@ if (USE_OPENSSL)
     message(FATAL_ERROR "TimescaleDB requires OpenSSL version 1.0 or greater")
   endif ()
 
+  if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND MSVC)
+    set(_libraries)
+    foreach(_path ${OPENSSL_LIBRARIES})
+      get_filename_component(_dir ${_path} DIRECTORY)
+      get_filename_component(_name ${_path} NAME_WE)
+      string(REGEX REPLACE "[Dd]$" "" _fixed ${_name})
+      get_filename_component(_ext ${_path} EXT)
+      list(APPEND _libraries "${_dir}/${_fixed}${_ext}")
+    endforeach()
+    set(OPENSSL_LIBRARIES ${_libraries})
+  endif()
+  message(STATUS "OPENSSL_LIBRARIES: ${OPENSSL_LIBRARIES}")
   message(STATUS "Using OpenSSL version ${OPENSSL_VERSION}")
 endif (USE_OPENSSL)
 

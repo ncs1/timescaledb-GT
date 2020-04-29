@@ -4,23 +4,41 @@
 `psql` with the `-X` flag to prevent any `.psqlrc` commands from
 accidentally triggering the load of a previous DB version.**
 
-## latest
+## 1.7.0 (2020-04-16)
+
+This release adds major new features and bugfixes since the 1.6.1 release.
+We deem it moderate priority for upgrading.
+
+This release adds the long-awaited support for PostgreSQL 12 to TimescaleDB.
+
+This release also adds a new default behavior when querying continuous
+aggregates that we call real-time aggregation. A query on a continuous
+aggregate will now combine materialized data with recent data that has
+yet to be materialized.
+
+Note that only newly created continuous aggregates will have this
+real-time query behavior, although it can be enabled on existing
+continuous aggregates with a configuration setting as follows:
+
+ALTER VIEW continuous_view_name SET (timescaledb.materialized_only=false);
+
+This release also moves several data management lifecycle features
+to the Community version of TimescaleDB (from Enterprise), including
+data reordering and data retention policies.
 
 **Major Features**
-
-**Minor Features**
-* #1666 Support drop_chunks API for continuous aggregates
-* #1711 Change log level for continuous aggregate materialization messages
+* #1456 Add support for PostgreSQL 12
+* #1685 Add support for real-time aggregation on continuous aggregates
 
 **Bugfixes**
-* #1648 Drop chunks from materialized hypertable
 * #1665 Add ignore_invalidation_older_than to timescaledb_information.continuous_aggregates view
-* #1668 Cannot add dimension if hypertable has empty chunks
-* #1674 Fix time_bucket_gapfill's interaction with GROUP BY
-* #1686 Fix order by queries on compressed hypertables that have char segment by column
-* #1687 Fix issue with disabling compression when foreign keys are present
-* #1715 Fix issue with overly aggressive chunk exclusion in outer joins
-* #1727 Fix compressing INTERVAL columns
+* #1750 Handle undefined ignore_invalidation_older_than
+* #1757 Restrict watermark to max for continuous aggregates
+* #1769 Add rescan function to CompressChunkDml CustomScan node
+* #1785 Fix last_run_success value in continuous_aggregate_stats view
+* #1801 Include parallel leader in plan execution
+* #1808 Fix ts_hypertable_get_all for compressed tables
+* #1828 Ignore dropped chunks in compressed_chunk_stats
 
 **Licensing changes**
 * Reorder and policies around reorder and drop chunks are now
@@ -28,9 +46,64 @@ accidentally triggering the load of a previous DB version.**
 * Gapfill functionality no longer warns about expired license
 
 **Thanks**
+
+* @t0k4rt for reporting an issue with parallel chunk append plans
+* @alxndrdude for reporting an issue when trying to insert into compressed chunks
+* @Olernov for reporting and fixing an issue with show_chunks and drop_chunks for compressed hypertables
+* @mjb512 for reporting an issue with INSERTs in CTEs in cached plans
+* @dmarsh19 for reporting and fixing an issue with dropped chunks in compressed_chunk_stats
+
+## 1.6.1 (2020-03-18)
+
+This maintenance release contains bugfixes since the 1.6.0 release. We deem it medium
+priority for upgrading.
+
+In particular the fixes contained in this maintenance release address bugs in continuous
+aggregates, time_bucket_gapfill, partial index handling and drop_chunks.
+
+**For this release only**, you will need to restart the database after upgrade before
+restoring a backup.
+
+**Minor Features**
+* #1666 Support drop_chunks API for continuous aggregates
+* #1711 Change log level for continuous aggregate materialization messages
+
+**Bugfixes**
+* #1630 Print notice for COPY TO on hypertable
+* #1648 Drop chunks from materialized hypertable
+* #1668 Cannot add dimension if hypertable has empty chunks
+* #1673 Fix crash when interrupting create_hypertable
+* #1674 Fix time_bucket_gapfill's interaction with GROUP BY
+* #1686 Fix order by queries on compressed hypertables that have char segment by column
+* #1687 Fix issue with disabling compression when foreign keys are present
+* #1688 Handle many BGW jobs better
+* #1698 Add logic to ignore dropped chunks in hypertable_relation_size
+* #1704 Fix bad plan for continuous aggregate materialization
+* #1709 Prevent starting background workers with NOLOGIN
+* #1713 Fix miscellaneous background worker issues
+* #1715 Fix issue with overly aggressive chunk exclusion in outer joins
+* #1719 Fix restoring/scheduler entrypoint to avoid BGW death
+* #1720 Add scheduler cache invalidations
+* #1727 Fix compressing INTERVAL columns
+* #1728 Handle Sort nodes in ConstraintAwareAppend
+* #1730 Fix partial index handling on hypertables
+* #1739 Use release OpenSSL DLLs for debug builds on Windows
+* #1740 Fix invalidation entries from multiple caggs on same hypertable
+* #1743 Fix continuous aggregate materialization timezone handling
+* #1748 Fix remove_drop_chunks_policy for continuous aggregates
+* #1756 Fix handling of dropped chunks in compression background worker
+
+**Thanks**
 * @RJPhillips01 for reporting an issue with drop chunks.
 * @b4eEx for reporting an issue with disabling compression.
-* @dark048 for reporting an issue with order by on compressed hypertables
+* @darko408 for reporting an issue with order by on compressed hypertables
+* @mrechte for reporting an issue with compressing INTERVAL columns
+* @tstaehli for reporting an issue with ConstraintAwareAppend
+* @chadshowalter for reporting an issue with partial index on hypertables
+* @geoffreybennett for reporting an issue with create_hypertable when interrupting operations
+* @alxndrdude for reporting an issue with background workers during restore
+* @zcavaliero for reporting and fixing an issue with dropped columns in hypertable_relation_size
+* @ismailakpolat for reporting an issue with cagg materialization on hypertables with TIMESTAMP column
 
 ## 1.6.0 (2020-01-14)
 

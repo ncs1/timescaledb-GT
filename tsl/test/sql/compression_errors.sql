@@ -20,10 +20,6 @@ ALTER TABLE foo2 set (timescaledb.compress, timescaledb.compress_segmentby = '"b
 ALTER TABLE foo2 set (timescaledb.compress, timescaledb.compress_segmentby = '"bacB toD",c' , timescaledb.compress_orderby = 'd DESC');
 ALTER TABLE foo2 set (timescaledb.compress, timescaledb.compress_segmentby = '"bacB toD",c' , timescaledb.compress_orderby = 'd');
 
-create table with_oids (a integer, b integer) WITH OIDS;
-select table_name from create_hypertable('with_oids', 'a', chunk_time_interval=> 10);
-ALTER TABLE with_oids set (timescaledb.compress, timescaledb.compress_orderby='a');
-
 create table with_rls (a integer, b integer);
 ALTER TABLE with_rls ENABLE ROW LEVEL SECURITY;
 select table_name from create_hypertable('with_rls', 'a', chunk_time_interval=> 10);
@@ -204,10 +200,6 @@ select compress_chunk(:'CHUNK_NAME');
 
 SELECT  hypertable_name , total_chunks , number_compressed_chunks
 FROM timescaledb_information.compressed_hypertable_stats;
---delete from foreign table, should delete from hypertable too
-select device_id, d from table_constr order by device_id, d;
-delete from fortable where col = 1 or col = 10;
-select device_id, d from table_constr order by device_id, d;
 
 --github issue 1661
 --disable compression after enabling it on a table that has fk constraints

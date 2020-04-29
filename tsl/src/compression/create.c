@@ -218,15 +218,17 @@ compresscolinfo_init(CompressColInfo *cc, Oid srctbl_relid, List *segmentby_cols
 	Oid compresseddata_oid = ts_custom_type_cache_get(CUSTOM_TYPE_COMPRESSED_DATA)->type_oid;
 
 	seg_attnolen = list_length(segmentby_cols);
-	rel = relation_open(srctbl_relid, AccessShareLock);
+	rel = table_open(srctbl_relid, AccessShareLock);
 	segorder_colindex = palloc0(sizeof(int32) * (rel->rd_att->natts));
 	tupdesc = rel->rd_att;
 	i = 1;
 
+#if PG12_LT
 	if (rel->rd_rel->relhasoids)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("compression cannot be used on table with OIDs")));
+#endif
 
 	foreach (lc, segmentby_cols)
 	{
@@ -319,7 +321,7 @@ compresscolinfo_init(CompressColInfo *cc, Oid srctbl_relid, List *segmentby_cols
 	cc->numcols = colno;
 	compresscolinfo_add_metadata_columns(cc, rel);
 	pfree(segorder_colindex);
-	relation_close(rel, AccessShareLock);
+	table_close(rel, AccessShareLock);
 }
 
 /* modify storage attributes for toast table columns attached to the
@@ -370,7 +372,7 @@ compresscolinfo_add_catalog_entries(CompressColInfo *compress_cols, int32 htid)
 	int i;
 	CatalogSecurityContext sec_ctx;
 
-	rel = heap_open(catalog_get_table_id(catalog, HYPERTABLE_COMPRESSION), RowExclusiveLock);
+	rel = table_open(catalog_get_table_id(catalog, HYPERTABLE_COMPRESSION), RowExclusiveLock);
 	desc = RelationGetDescr(rel);
 
 	for (i = 0; i < compress_cols->numcols; i++)
@@ -383,14 +385,15 @@ compresscolinfo_add_catalog_entries(CompressColInfo *compress_cols, int32 htid)
 		ts_catalog_restore_user(&sec_ctx);
 	}
 
-	heap_close(rel, NoLock); /*lock will be released at end of transaction only*/
+	table_close(rel, NoLock); /*lock will be released at end of transaction only*/
 }
 
 static void
 create_compressed_table_indexes(Oid compresstable_relid, CompressColInfo *compress_cols)
 {
 	Cache *hcache;
-	Hypertable *ht = ts_hypertable_cache_get_cache_and_entry(compresstable_relid, false, &hcache);
+	Hypertable *ht =
+		ts_hypertable_cache_get_cache_and_entry(compresstable_relid, CACHE_FLAG_NONE, &hcache);
 	IndexStmt stmt = {
 		.type = T_IndexStmt,
 		.accessMethod = DEFAULT_INDEX_TYPE,
@@ -443,8 +446,8 @@ create_compressed_table_indexes(Oid compresstable_relid, CompressColInfo *compre
 static void
 set_statistics_on_compressed_table(Oid compressed_table_id)
 {
-	Relation table_rel = relation_open(compressed_table_id, ShareUpdateExclusiveLock);
-	Relation attrelation = relation_open(AttributeRelationId, RowExclusiveLock);
+	Relation table_rel = table_open(compressed_table_id, ShareUpdateExclusiveLock);
+	Relation attrelation = table_open(AttributeRelationId, RowExclusiveLock);
 	TupleDesc table_desc = RelationGetDescr(table_rel);
 	Oid compressed_data_type = ts_custom_type_cache_get(CUSTOM_TYPE_COMPRESSED_DATA)->type_oid;
 	for (int i = 0; i < table_desc->natts; i++)
@@ -484,8 +487,8 @@ set_statistics_on_compressed_table(Oid compressed_table_id)
 		heap_freetuple(tuple);
 	}
 
-	RelationClose(attrelation);
-	RelationClose(table_rel);
+	table_close(attrelation, NoLock);
+	table_close(table_rel, NoLock);
 }
 
 #if !PG96 && !PG10
@@ -568,6 +571,8 @@ create_compress_chunk_table(Hypertable *compress_ht, Chunk *src_chunk)
 	Catalog *catalog = ts_catalog_get();
 	CatalogSecurityContext sec_ctx;
 	Chunk *compress_chunk;
+	int namelen;
+	const char *tablespace;
 
 	/* Create a new chunk based on the hypercube */
 	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
@@ -580,13 +585,20 @@ create_compress_chunk_table(Hypertable *compress_ht, Chunk *src_chunk)
 	compress_chunk->hypertable_relid = compress_ht->main_table_relid;
 	compress_chunk->constraints = ts_chunk_constraints_alloc(1, CurrentMemoryContext);
 	namestrcpy(&compress_chunk->fd.schema_name, INTERNAL_SCHEMA_NAME);
-	snprintf(compress_chunk->fd.table_name.data,
-			 NAMEDATALEN,
-			 "compress%s_%d_chunk",
-			 NameStr(compress_ht->fd.associated_table_prefix),
-			 compress_chunk->fd.id);
 
-	;
+	/* Fail if we overflow the name limit */
+	namelen = snprintf(NameStr(compress_chunk->fd.table_name),
+					   NAMEDATALEN,
+					   "compress%s_%d_chunk",
+					   NameStr(compress_ht->fd.associated_table_prefix),
+					   compress_chunk->fd.id);
+
+	if (namelen >= NAMEDATALEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("invalid name \"%s\" for compressed chunk",
+						NameStr(compress_chunk->fd.table_name)),
+				 errdetail("The associated table prefix is too long.")));
 
 	/* Insert chunk */
 	ts_chunk_insert_lock(compress_chunk, RowExclusiveLock);
@@ -603,13 +615,11 @@ create_compress_chunk_table(Hypertable *compress_ht, Chunk *src_chunk)
 	 * on which to base this decision. We simply pick the same tablespace as the uncompressed chunk
 	 * for now.
 	 */
-	compress_chunk->table_id =
-		ts_chunk_create_table(compress_chunk,
-							  compress_ht,
-							  get_tablespace_name(get_rel_tablespace(src_chunk->table_id)));
+	tablespace = get_tablespace_name(get_rel_tablespace(src_chunk->table_id));
+	compress_chunk->table_id = ts_chunk_create_table(compress_chunk, compress_ht, tablespace);
 
 	if (!OidIsValid(compress_chunk->table_id))
-		elog(ERROR, "could not create compress chunk table");
+		elog(ERROR, "could not create compressed chunk table");
 
 	/* Create the chunk's constraints*/
 	ts_chunk_constraints_create(compress_chunk->constraints,
@@ -618,7 +628,7 @@ create_compress_chunk_table(Hypertable *compress_ht, Chunk *src_chunk)
 								compress_chunk->hypertable_relid,
 								compress_chunk->fd.hypertable_id);
 
-	ts_trigger_create_all_on_chunk(compress_ht, compress_chunk);
+	ts_trigger_create_all_on_chunk(compress_chunk);
 
 	ts_chunk_index_create_all(compress_chunk->fd.hypertable_id,
 							  compress_chunk->hypertable_relid,
@@ -697,7 +707,7 @@ validate_existing_constraints(Hypertable *ht, CompressColInfo *colinfo)
 	List *conlist = NIL;
 	ArrayType *arr;
 
-	pg_constr = heap_open(ConstraintRelationId, AccessShareLock);
+	pg_constr = table_open(ConstraintRelationId, AccessShareLock);
 
 	ScanKeyInit(&scankey,
 				Anum_pg_constraint_conrelid,
@@ -729,14 +739,25 @@ validate_existing_constraints(Hypertable *ht, CompressColInfo *colinfo)
 		{
 			int j, numkeys;
 			int16 *attnums;
-			bool isNull;
+			bool is_null;
 			/* Extract the conkey array, ie, attnums of PK's columns */
 			Datum adatum = heap_getattr(tuple,
 										Anum_pg_constraint_conkey,
 										RelationGetDescr(pg_constr),
-										&isNull);
-			if (isNull)
-				elog(ERROR, "null conkey for constraint %u", HeapTupleGetOid(tuple));
+										&is_null);
+			if (is_null)
+			{
+#if PG12_LT
+				Oid oid = HeapTupleGetOid(tuple);
+#else
+				Oid oid = heap_getattr(tuple,
+									   Anum_pg_constraint_oid,
+									   RelationGetDescr(pg_constr),
+									   &is_null);
+#endif
+				elog(ERROR, "null conkey for constraint %u", oid);
+			}
+
 			arr = DatumGetArrayTypeP(adatum); /* ensure not toasted */
 			numkeys = ARR_DIMS(arr)[0];
 			if (ARR_NDIM(arr) != 1 || numkeys < 0 || ARR_HASNULL(arr) ||
@@ -763,7 +784,7 @@ validate_existing_constraints(Hypertable *ht, CompressColInfo *colinfo)
 										"column for compression",
 										NameStr(form->conname),
 										NameStr(col_def->attname)),
-								 errhint("Only segment by columns can be used in foreign key"
+								 errhint("Only segment by columns can be used in foreign key "
 										 "constraints on hypertables that are compressed.")));
 					}
 					else
@@ -793,7 +814,7 @@ validate_existing_constraints(Hypertable *ht, CompressColInfo *colinfo)
 	}
 
 	systable_endscan(scan);
-	heap_close(pg_constr, AccessShareLock);
+	table_close(pg_constr, AccessShareLock);
 	return conlist;
 }
 

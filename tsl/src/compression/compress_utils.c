@@ -88,7 +88,7 @@ compression_chunk_size_catalog_insert(int32 src_chunk_id, ChunkSize *src_size,
 	Datum values[Natts_compression_chunk_size];
 	bool nulls[Natts_compression_chunk_size] = { false };
 
-	rel = heap_open(catalog_get_table_id(catalog, COMPRESSION_CHUNK_SIZE), RowExclusiveLock);
+	rel = table_open(catalog_get_table_id(catalog, COMPRESSION_CHUNK_SIZE), RowExclusiveLock);
 	desc = RelationGetDescr(rel);
 
 	memset(values, 0, sizeof(values));
@@ -113,7 +113,7 @@ compression_chunk_size_catalog_insert(int32 src_chunk_id, ChunkSize *src_size,
 	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
 	ts_catalog_insert_values(rel, desc, values, nulls);
 	ts_catalog_restore_user(&sec_ctx);
-	heap_close(rel, RowExclusiveLock);
+	table_close(rel, RowExclusiveLock);
 }
 
 static void
@@ -139,7 +139,7 @@ chunk_dml_blocker_trigger_add(Oid relid)
 	objaddr = CreateTriggerCompat(&stmt, NULL, relid, InvalidOid, InvalidOid, InvalidOid, false);
 
 	if (!OidIsValid(objaddr.objectId))
-		elog(ERROR, "could not create dml blocker trigger");
+		elog(ERROR, "could not create DML blocker trigger");
 
 	return;
 }
@@ -161,7 +161,7 @@ chunk_dml_trigger_drop(Oid relid)
 static void
 compresschunkcxt_init(CompressChunkCxt *cxt, Cache *hcache, Oid hypertable_relid, Oid chunk_relid)
 {
-	Hypertable *srcht = ts_hypertable_cache_get_entry(hcache, hypertable_relid, false);
+	Hypertable *srcht = ts_hypertable_cache_get_entry(hcache, hypertable_relid, CACHE_FLAG_NONE);
 	Hypertable *compress_ht;
 	Chunk *srcchunk;
 
@@ -180,11 +180,11 @@ compresschunkcxt_init(CompressChunkCxt *cxt, Cache *hcache, Oid hypertable_relid
 	/* user has to be the owner of the compression table too */
 	ts_hypertable_permissions_check(compress_ht->main_table_relid, GetUserId());
 
-	if (!srcht->space) // something is wrong
+	if (!srcht->space) /* something is wrong */
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("missing hyperspace for hypertable")));
 	/* refetch the srcchunk with all attributes filled in */
-	srcchunk = ts_chunk_get_by_relid(chunk_relid, srcht->space->num_dimensions, true);
+	srcchunk = ts_chunk_get_by_relid(chunk_relid, true);
 	cxt->srcht = srcht;
 	cxt->compress_ht = compress_ht;
 	cxt->srcht_chunk = srcchunk;
@@ -216,10 +216,10 @@ compress_chunk_impl(Oid hypertable_relid, Oid chunk_relid)
 					AccessShareLock);
 	LockRelationOid(catalog_get_table_id(ts_catalog_get(), CHUNK), RowExclusiveLock);
 
-	// get compression properties for hypertable
+	/* get compression properties for hypertable */
 	htcols_list = ts_hypertable_compression_get(cxt.srcht->fd.id);
 	htcols_listlen = list_length(htcols_list);
-	// create compressed chunk DDL and compress the data
+	/* create compressed chunk DDL and compress the data */
 	compress_ht_chunk = create_compress_chunk_table(cxt.compress_ht, cxt.srcht_chunk);
 	/* convert list to array of pointers for compress_chunk */
 	colinfo_array = palloc(sizeof(ColumnCompressionInfo *) * htcols_listlen);
@@ -233,6 +233,11 @@ compress_chunk_impl(Oid hypertable_relid, Oid chunk_relid)
 				   compress_ht_chunk->table_id,
 				   colinfo_array,
 				   htcols_listlen);
+	/* Drop all FK constraints on the uncompressed chunk. This is needed to allow
+	 * cascading deleted data in FK-referenced tables, while blocking deleting data
+	 * directly on the hypertable or chunks.
+	 */
+	ts_chunk_drop_fks(cxt.srcht_chunk);
 	chunk_dml_blocker_trigger_add(cxt.srcht_chunk->table_id);
 	after_size = compute_chunk_size(compress_ht_chunk->table_id);
 	compression_chunk_size_catalog_insert(cxt.srcht_chunk->fd.id,
@@ -249,7 +254,9 @@ decompress_chunk_impl(Oid uncompressed_hypertable_relid, Oid uncompressed_chunk_
 {
 	Cache *hcache;
 	Hypertable *uncompressed_hypertable =
-		ts_hypertable_cache_get_cache_and_entry(uncompressed_hypertable_relid, false, &hcache);
+		ts_hypertable_cache_get_cache_and_entry(uncompressed_hypertable_relid,
+												CACHE_FLAG_NONE,
+												&hcache);
 	Hypertable *compressed_hypertable;
 	Chunk *uncompressed_chunk;
 	Chunk *compressed_chunk;
@@ -261,7 +268,7 @@ decompress_chunk_impl(Oid uncompressed_hypertable_relid, Oid uncompressed_chunk_
 	if (compressed_hypertable == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("missing compressed hypertable")));
 
-	uncompressed_chunk = ts_chunk_get_by_relid(uncompressed_chunk_relid, 0, true);
+	uncompressed_chunk = ts_chunk_get_by_relid(uncompressed_chunk_relid, true);
 	if (uncompressed_chunk == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -279,7 +286,7 @@ decompress_chunk_impl(Oid uncompressed_hypertable_relid, Oid uncompressed_chunk_
 		return false;
 	}
 
-	compressed_chunk = ts_chunk_get_by_id(uncompressed_chunk->fd.compressed_chunk_id, 0, true);
+	compressed_chunk = ts_chunk_get_by_id(uncompressed_chunk->fd.compressed_chunk_id, true);
 
 	/* acquire locks on src and compress hypertable and src chunk */
 	LockRelationOid(uncompressed_hypertable->main_table_relid, AccessShareLock);
@@ -293,6 +300,8 @@ decompress_chunk_impl(Oid uncompressed_hypertable_relid, Oid uncompressed_chunk_
 
 	chunk_dml_trigger_drop(uncompressed_chunk->table_id);
 	decompress_chunk(compressed_chunk->table_id, uncompressed_chunk->table_id);
+	/* Recreate FK constraints, since they were dropped during compression. */
+	ts_chunk_create_fks(uncompressed_chunk);
 	ts_compression_chunk_size_delete(uncompressed_chunk->fd.id);
 	ts_chunk_set_compressed_chunk(uncompressed_chunk, INVALID_CHUNK_ID, true);
 	ts_chunk_drop(compressed_chunk, DROP_RESTRICT, -1);
@@ -304,7 +313,7 @@ decompress_chunk_impl(Oid uncompressed_hypertable_relid, Oid uncompressed_chunk_
 bool
 tsl_compress_chunk_wrapper(Oid chunk_relid, bool if_not_compressed)
 {
-	Chunk *srcchunk = ts_chunk_get_by_relid(chunk_relid, 0, true);
+	Chunk *srcchunk = ts_chunk_get_by_relid(chunk_relid, true);
 	if (srcchunk->fd.compressed_chunk_id != INVALID_CHUNK_ID)
 	{
 		ereport((if_not_compressed ? NOTICE : ERROR),
@@ -332,9 +341,9 @@ tsl_decompress_chunk(PG_FUNCTION_ARGS)
 {
 	Oid uncompressed_chunk_id = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
 	bool if_compressed = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
-	Chunk *uncompressed_chunk = ts_chunk_get_by_relid(uncompressed_chunk_id, 0, true);
+	Chunk *uncompressed_chunk = ts_chunk_get_by_relid(uncompressed_chunk_id, true);
 	if (NULL == uncompressed_chunk)
-		elog(ERROR, "unkown chunk id %d", uncompressed_chunk_id);
+		elog(ERROR, "unknown chunk id %d", uncompressed_chunk_id);
 
 	if (!decompress_chunk_impl(uncompressed_chunk->hypertable_relid,
 							   uncompressed_chunk_id,

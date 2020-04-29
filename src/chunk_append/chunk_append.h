@@ -7,8 +7,6 @@
 #define TIMESCALEDB_CHUNK_APPEND_H
 
 #include <postgres.h>
-#include <nodes/relation.h>
-#include <nodes/extensible.h>
 
 #include "hypertable.h"
 

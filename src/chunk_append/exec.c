@@ -3,7 +3,6 @@
  * Please see the included NOTICE for copyright information and
  * LICENSE-APACHE for a copy of the license.
  */
-
 #include <postgres.h>
 #include <fmgr.h>
 #include <miscadmin.h>
@@ -12,11 +11,8 @@
 #include <nodes/bitmapset.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
-#include <nodes/relation.h>
-#include <optimizer/clauses.h>
 #include <optimizer/cost.h>
 #include <optimizer/plancat.h>
-#include <optimizer/predtest.h>
 #include <optimizer/prep.h>
 #include <optimizer/restrictinfo.h>
 #include <parser/parsetree.h>
@@ -26,12 +22,19 @@
 
 #include <math.h>
 
-#include "chunk_append/chunk_append.h"
+#include "compat.h"
+#if PG12_LT
+#include <optimizer/clauses.h>
+#include <optimizer/predtest.h>
+#else
+#include <optimizer/optimizer.h>
+#endif
+
 #include "chunk_append/exec.h"
+#include "chunk_append/chunk_append.h"
 #include "chunk_append/explain.h"
 #include "chunk_append/planner.h"
 #include "loader/lwlocks.h"
-#include "compat.h"
 
 #define INVALID_SUBPLAN_INDEX -1
 #define NO_MATCHING_SUBPLANS -2
@@ -213,6 +216,29 @@ chunk_append_begin(CustomScanState *node, EState *estate, int eflags)
 	ListCell *lc;
 	int i;
 
+#if PG12_GE
+	/* CustomScan hard-codes the scan and result tuple slot to a fixed
+	 * TTSOpsVirtual ops (meaning it expects the slot ops of the child tuple to
+	 * also have this type). Oddly, when reading slots from subscan nodes
+	 * (children), there is no knowing what tuple slot ops the child slot will
+	 * have (e.g., for ChunkAppend it is common that the child is a
+	 * seqscan/indexscan that produces a TTSOpsBufferHeapTuple
+	 * slot). Unfortunately, any mismatch between slot types when projecting is
+	 * asserted by PostgreSQL. To avoid this issue, we mark the scanops as
+	 * non-fixed and reinitialize the projection state with this new setting.
+	 *
+	 * Alternatively, we could copy the child tuple into the scan slot to get
+	 * the expected ops before projection, but this would require materializing
+	 * and copying the tuple unnecessarily.
+	 */
+	node->ss.ps.scanopsfixed = false;
+
+	/* Since we sometimes return the scan slot directly from the subnode, the
+	 * result slot is not fixed either. */
+	node->ss.ps.resultopsfixed = false;
+	ExecAssignScanProjectionInfoWithVarno(&node->ss, INDEX_VAR);
+#endif
+
 	initialize_constraints(state, lthird(cscan->custom_private));
 
 	if (state->startup_exclusion)
@@ -341,11 +367,12 @@ static TupleTableSlot *
 chunk_append_exec(CustomScanState *node)
 {
 	ChunkAppendState *state = (ChunkAppendState *) node;
-	TupleTableSlot *subslot;
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
+	ProjectionInfo *projinfo = node->ss.ps.ps_ProjInfo;
+	TupleTableSlot *subslot;
 #if PG96
 	TupleTableSlot *resultslot;
-	ExprDoneCond isDone;
+	ExprDoneCond isdone;
 #endif
 
 	if (state->current == INVALID_SUBPLAN_INDEX)
@@ -354,9 +381,9 @@ chunk_append_exec(CustomScanState *node)
 #if PG96
 	if (node->ss.ps.ps_TupFromTlist)
 	{
-		resultslot = ExecProject(node->ss.ps.ps_ProjInfo, &isDone);
+		resultslot = ExecProject(projinfo, &isdone);
 
-		if (isDone == ExprMultipleResult)
+		if (isdone == ExprMultipleResult)
 			return resultslot;
 
 		node->ss.ps.ps_TupFromTlist = false;
@@ -373,7 +400,6 @@ chunk_append_exec(CustomScanState *node)
 			return ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 
 		Assert(state->current >= 0 && state->current < state->num_subplans);
-
 		subnode = state->subplanstates[state->current];
 
 		/*
@@ -387,22 +413,22 @@ chunk_append_exec(CustomScanState *node)
 			 * If the subplan gave us something check if we need
 			 * to do projection otherwise return as is.
 			 */
-			if (node->ss.ps.ps_ProjInfo == NULL)
+			if (projinfo == NULL)
 				return subslot;
 
 			ResetExprContext(econtext);
 			econtext->ecxt_scantuple = subslot;
 
 #if PG96
-			resultslot = ExecProject(node->ss.ps.ps_ProjInfo, &isDone);
+			resultslot = ExecProject(projinfo, &isdone);
 
-			if (isDone != ExprEndResult)
+			if (isdone != ExprEndResult)
 			{
-				node->ss.ps.ps_TupFromTlist = (isDone == ExprMultipleResult);
+				node->ss.ps.ps_TupFromTlist = (isdone == ExprMultipleResult);
 				return resultslot;
 			}
 #else
-			return ExecProject(node->ss.ps.ps_ProjInfo);
+			return ExecProject(projinfo);
 #endif
 		}
 
@@ -449,7 +475,15 @@ choose_next_subplan_non_parallel(ChunkAppendState *state)
 static void
 choose_next_subplan_for_leader(ChunkAppendState *state)
 {
-	state->current = NO_MATCHING_SUBPLANS;
+	/*
+	 * If no workers got launched for this parallel plan
+	 * we have to let leader participate in subplan
+	 * execution.
+	 */
+	if (state->pcxt->nworkers_launched == 0)
+		choose_next_subplan_for_worker(state);
+	else
+		state->current = NO_MATCHING_SUBPLANS;
 }
 
 static void
@@ -616,6 +650,7 @@ chunk_append_initialize_dsm(CustomScanState *node, ParallelContext *pcxt, void *
 
 	state->choose_next_subplan = choose_next_subplan_for_leader;
 	state->current = INVALID_SUBPLAN_INDEX;
+	state->pcxt = pcxt;
 	state->pstate = pstate;
 }
 
@@ -772,7 +807,7 @@ ca_get_relation_constraints(Oid relationObjectId, Index varno, bool include_notn
 	/*
 	 * We assume the relation has already been safely locked.
 	 */
-	relation = heap_open(relationObjectId, NoLock);
+	relation = table_open(relationObjectId, AccessShareLock);
 
 	constr = relation->rd_att->constr;
 	if (constr != NULL)
@@ -854,7 +889,7 @@ ca_get_relation_constraints(Oid relationObjectId, Index varno, bool include_notn
 		}
 	}
 
-	heap_close(relation, NoLock);
+	table_close(relation, NoLock);
 
 	return result;
 }

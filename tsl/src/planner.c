@@ -16,6 +16,8 @@
 #include "hypertable_compression.h"
 #include "guc.h"
 
+#include <math.h>
+
 void
 tsl_create_upper_paths_hook(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *input_rel,
 							RelOptInfo *output_rel)
@@ -37,7 +39,7 @@ tsl_set_rel_pathlist_query(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeT
 		rel->reloptkind == RELOPT_OTHER_MEMBER_REL && TS_HYPERTABLE_HAS_COMPRESSION(ht) &&
 		rel->fdw_private != NULL && ((TimescaleDBPrivate *) rel->fdw_private)->compressed)
 	{
-		Chunk *chunk = ts_chunk_get_by_relid(rte->relid, 0, true);
+		Chunk *chunk = ts_chunk_get_by_relid(rte->relid, true);
 
 		if (chunk->fd.compressed_chunk_id > 0)
 			ts_decompress_chunk_generate_paths(root, rel, ht, chunk);
@@ -50,11 +52,7 @@ tsl_set_rel_pathlist_dml(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTbl
 	if (ht != NULL && TS_HYPERTABLE_HAS_COMPRESSION(ht))
 	{
 		ListCell *lc;
-		/* is this a chunk under compressed hypertable ? */
-		AppendRelInfo *appinfo = ts_get_appendrelinfo(root, rti, false);
-		Oid PG_USED_FOR_ASSERTS_ONLY parent_oid = appinfo->parent_reloid;
-		Chunk *chunk = ts_chunk_get_by_relid(rte->relid, 0, true);
-		Assert(parent_oid == ht->main_table_relid && (parent_oid == chunk->hypertable_relid));
+		Chunk *chunk = ts_chunk_get_by_relid(rte->relid, true);
 		if (chunk->fd.compressed_chunk_id > 0)
 		{
 			foreach (lc, rel->pathlist)

@@ -11,12 +11,10 @@
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
 #include <nodes/plannodes.h>
-#include <optimizer/clauses.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/prep.h>
 #include <optimizer/restrictinfo.h>
 #include <optimizer/tlist.h>
-#include <optimizer/var.h>
 #include <parser/parse_func.h>
 #include <parser/parsetree.h>
 #include <utils/date.h>
@@ -33,11 +31,18 @@
 #include <optimizer/cost.h>
 #endif
 
+#if PG12_LT
+#include <optimizer/clauses.h>
+#include <optimizer/var.h>
+#elif PG12_GE
+#include <optimizer/optimizer.h>
+#endif
+
+#include "import/planner.h"
 #include "plan_expand_hypertable.h"
 #include "hypertable.h"
 #include "hypertable_restrict_info.h"
 #include "planner.h"
-#include "planner_import.h"
 #include "chunk_append/chunk_append.h"
 #include "guc.h"
 #include "extension.h"
@@ -439,7 +444,8 @@ static Node *
 process_quals(Node *quals, CollectQualCtx *ctx, bool is_outer_join)
 {
 	ListCell *lc;
-	ListCell *prev = NULL;
+
+	ListCell *prev pg_attribute_unused() = NULL;
 	List *additional_quals = NIL;
 
 	for (lc = list_head((List *) quals); lc != NULL; prev = lc, lc = lnext(lc))
@@ -465,7 +471,15 @@ process_quals(Node *quals, CollectQualCtx *ctx, bool is_outer_join)
 
 			ctx->chunk_exclusion_func = func_expr;
 			ctx->restrictions = NIL;
+			/* In PG12 removing the chunk_exclusion function here causes issues
+			 * when the first/last optimization fires, as those subqueries
+			 * will not see the function. Fortunately, in pg12 we do not the
+			 * baserestrictinfo is already populated by the time this function
+			 * is called, so we can remove the functions from that directly
+			 */
+#if PG12_LT
 			quals = (Node *) list_delete_cell((List *) quals, lc, prev);
+#endif
 			return quals;
 		}
 
@@ -501,6 +515,87 @@ process_quals(Node *quals, CollectQualCtx *ctx, bool is_outer_join)
 		 * relation when it should show all rows */
 		if (!is_outer_join)
 			ctx->restrictions = lappend(ctx->restrictions, make_simple_restrictinfo(qual));
+	}
+	return (Node *) list_concat((List *) quals, additional_quals);
+}
+
+#if PG12_GE
+static List *
+remove_exclusion_fns(List *restrictinfo)
+{
+	ListCell *prev = NULL;
+	ListCell *lc = list_head(restrictinfo);
+
+	while (lc != NULL)
+	{
+		RestrictInfo *rinfo = lfirst(lc);
+		Expr *qual = rinfo->clause;
+
+		if (is_chunk_exclusion_func(qual))
+		{
+			FuncExpr *func_expr = (FuncExpr *) qual;
+
+			/* validation */
+			Assert(func_expr->args->length == 2);
+			if (!IsA(linitial(func_expr->args), Var))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("first parameter for chunks_in function needs to be record")));
+
+			restrictinfo = list_delete_cell((List *) restrictinfo, lc, prev);
+			return restrictinfo;
+		}
+		prev = lc;
+		lc = lnext(lc);
+	}
+	return restrictinfo;
+}
+#endif
+
+static Node *
+timebucket_annotate(Node *quals, CollectQualCtx *ctx)
+{
+	ListCell *lc;
+	List *additional_quals = NIL;
+
+	foreach (lc, castNode(List, quals))
+	{
+		Expr *qual = lfirst(lc);
+		Relids relids = pull_varnos((Node *) qual);
+		int num_rels = bms_num_members(relids);
+
+		/* stop processing if not for current rel */
+		if (num_rels != 1 || !bms_is_member(ctx->rel->relid, relids))
+			continue;
+
+		if (IsA(qual, OpExpr) && list_length(castNode(OpExpr, qual)->args) == 2)
+		{
+			OpExpr *op = castNode(OpExpr, qual);
+			Expr *left = linitial(op->args);
+			Expr *right = lsecond(op->args);
+
+			/*
+			 * check for time_bucket comparisons
+			 * time_bucket(Const, time_colum) > Const
+			 */
+			if ((IsA(left, FuncExpr) && IsA(right, Const) &&
+				 list_length(castNode(FuncExpr, left)->args) == 2 &&
+				 is_time_bucket_function(left)) ||
+				(IsA(left, Const) && IsA(right, FuncExpr) &&
+				 list_length(castNode(FuncExpr, right)->args) == 2 &&
+				 is_time_bucket_function(right)))
+			{
+				qual = (Expr *) transform_time_bucket_comparison(ctx->root, op);
+				/*
+				 * if we could transform the expression we add it to the list of
+				 * quals so it can be used as an index condition
+				 */
+				if (qual != (Expr *) op)
+					additional_quals = lappend(additional_quals, qual);
+			}
+		}
+
+		ctx->restrictions = lappend(ctx->restrictions, make_simple_restrictinfo(qual));
 	}
 	return (Node *) list_concat((List *) quals, additional_quals);
 }
@@ -633,22 +728,6 @@ should_order_append(PlannerInfo *root, RelOptInfo *rel, Hypertable *ht, List *jo
 	return ts_ordered_append_should_optimize(root, rel, ht, join_conditions, order_attno, reverse);
 }
 
-bool
-ts_plan_expand_hypertable_valid_hypertable(Hypertable *ht, Query *parse, Index rti,
-										   RangeTblEntry *rte)
-{
-	if (ht == NULL ||
-		/* inheritance enabled */
-		rte->inh == false ||
-		/* row locks not necessary */
-		parse->rowMarks != NIL ||
-		/* not update and/or delete */
-		0 != parse->resultRelation)
-		return false;
-
-	return true;
-}
-
 /*  get chunk oids specified by explicit chunk exclusion function */
 static List *
 get_explicit_chunk_oids(CollectQualCtx *ctx, Hypertable *ht)
@@ -679,7 +758,7 @@ get_explicit_chunk_oids(CollectQualCtx *ctx, Hypertable *ht)
 		if (!isnull)
 		{
 			int32 chunk_id = DatumGetInt32(elem);
-			Chunk *chunk = ts_chunk_get_by_id(chunk_id, 0, false);
+			Chunk *chunk = ts_chunk_get_by_id(chunk_id, false);
 
 			if (chunk == NULL)
 				ereport(ERROR, (errmsg("chunk id %d not found", chunk_id)));
@@ -736,20 +815,18 @@ get_chunk_oids(CollectQualCtx *ctx, PlannerInfo *root, RelOptInfo *rel, Hypertab
 		if (rel->fdw_private != NULL &&
 			should_order_append(root, rel, ht, ctx->join_conditions, &order_attno, &reverse))
 		{
-			TimescaleDBPrivate *private = (TimescaleDBPrivate *) rel->fdw_private;
+			TimescaleDBPrivate *priv = ts_get_private_reloptinfo(rel);
 			List **nested_oids = NULL;
 
-		  private
-			->appends_ordered = true;
-		  private
-			->order_attno = order_attno;
+			priv->appends_ordered = true;
+			priv->order_attno = order_attno;
 
 			/*
 			 * for space partitioning we need extra information about the
 			 * time slices of the chunks
 			 */
 			if (ht->space->num_dimensions > 1)
-				nested_oids = &private->nested_oids;
+				nested_oids = &priv->nested_oids;
 
 			return ts_hypertable_restrict_info_get_chunk_oids_ordered(hri,
 																	  ht,
@@ -869,20 +946,69 @@ build_hypertable_partition_info(Hypertable *ht, PlannerInfo *root, RelOptInfo *h
 	hyper_rel->partexprs = get_hypertable_partexprs(ht, root->parse, hyper_rel->relid);
 	hyper_rel->nullable_partexprs = (List **) palloc0(sizeof(List *) * part_scheme->partnatts);
 	hyper_rel->boundinfo = palloc(sizeof(PartitionBoundInfoData));
+	hyper_rel->part_rels = palloc0(sizeof(*hyper_rel->part_rels) * nparts);
 }
 
 #endif /* PG11_GE */
 
+static bool
+timebucket_annotate_walker(Node *node, CollectQualCtx *ctx)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, FromExpr))
+	{
+		FromExpr *f = castNode(FromExpr, node);
+		f->quals = timebucket_annotate(f->quals, ctx);
+		collect_join_quals(f->quals, ctx, true);
+	}
+	else if (IsA(node, JoinExpr))
+	{
+		JoinExpr *j = castNode(JoinExpr, node);
+		j->quals = timebucket_annotate(j->quals, ctx);
+		collect_join_quals(j->quals, ctx, !IS_OUTER_JOIN(j->jointype));
+	}
+
+	/* skip processing if we found a chunks_in call for current relation */
+	if (ctx->chunk_exclusion_func != NULL)
+		return true;
+
+	return expression_tree_walker(node, timebucket_annotate_walker, ctx);
+}
+
+void
+ts_plan_expand_timebucket_annotate(PlannerInfo *root, RelOptInfo *rel)
+{
+	CollectQualCtx ctx = {
+		.root = root,
+		.rel = rel,
+		.restrictions = NIL,
+		.chunk_exclusion_func = NULL,
+		.all_quals = NIL,
+		.join_conditions = NIL,
+		.propagate_conditions = NIL,
+	};
+
+	init_chunk_exclusion_func();
+
+	/* Walk the tree and find restrictions or chunk exclusion functions */
+	timebucket_annotate_walker((Node *) root->parse->jointree, &ctx);
+
+	if (ctx.propagate_conditions != NIL)
+		propagate_join_quals(root, rel, &ctx);
+}
+
 /* Inspired by expand_inherited_rtentry but expands
  * a hypertable chunks into an append relationship */
 void
-ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, Oid parent_oid, bool inhparent,
-								 RelOptInfo *rel)
+ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, RelOptInfo *rel)
 {
 	RangeTblEntry *rte = rt_fetch(rel->relid, root->parse->rtable);
+	Oid parent_oid = rte->relid;
 	List *inh_oids;
 	ListCell *l;
-	Relation oldrelation = heap_open(parent_oid, NoLock);
+	Relation oldrelation = table_open(parent_oid, NoLock);
 	Query *parse = root->parse;
 	Index rti = rel->relid;
 	List *appinfos = NIL;
@@ -896,20 +1022,33 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, Oid parent_o
 		.join_conditions = NIL,
 		.propagate_conditions = NIL,
 	};
+	Size old_rel_array_len;
+	Index first_chunk_index = 0;
+#if PG12_GE
+	Index i;
+#endif
 
 	/* double check our permissions are valid */
 	Assert(rti != parse->resultRelation);
+
 	oldrc = get_plan_rowmark(root->rowMarks, rti);
+
 	if (oldrc && RowMarkRequiresRowShareLock(oldrc->markType))
 		elog(ERROR, "unexpected permissions requested");
 
-	/* mark the parent as an append relation */
+		/* mark the parent as an append relation */
+#if PG12_LT
 	rte->inh = true;
+#endif
 
 	init_chunk_exclusion_func();
 
 	/* Walk the tree and find restrictions or chunk exclusion functions */
 	collect_quals_walker((Node *) root->parse->jointree, &ctx);
+
+#if PG12_GE
+	rel->baserestrictinfo = remove_exclusion_fns(rel->baserestrictinfo);
+#endif
 
 	if (ctx.propagate_conditions != NIL)
 		propagate_join_quals(root, rel, &ctx);
@@ -920,11 +1059,21 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, Oid parent_o
 	 * the simple_*_array structures have already been set, we need to add the
 	 * children to them
 	 */
+	old_rel_array_len = root->simple_rel_array_size;
 	root->simple_rel_array_size += list_length(inh_oids);
 	root->simple_rel_array =
 		repalloc(root->simple_rel_array, root->simple_rel_array_size * sizeof(RelOptInfo *));
+	/* postgres expects these arrays to be 0'ed until intialized */
+	memset(root->simple_rel_array + old_rel_array_len,
+		   0,
+		   list_length(inh_oids) * sizeof(*root->simple_rel_array));
+
 	root->simple_rte_array =
 		repalloc(root->simple_rte_array, root->simple_rel_array_size * sizeof(RangeTblEntry *));
+	/* postgres expects these arrays to be 0'ed until intialized */
+	memset(root->simple_rte_array + old_rel_array_len,
+		   0,
+		   list_length(inh_oids) * sizeof(*root->simple_rte_array));
 
 #if PG11_GE
 	/* Adding partition info will make PostgreSQL consider the inheritance
@@ -941,10 +1090,16 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, Oid parent_o
 		RangeTblEntry *childrte;
 		Index child_rtindex;
 		AppendRelInfo *appinfo;
+#if PG12_LT
+		LOCKMODE chunk_lock = NoLock;
+#else
+		LOCKMODE chunk_lock = rte->rellockmode;
+#endif
 
-		/* Open rel if needed; we already have required locks */
+		/* Open rel if needed */
+
 		if (child_oid != parent_oid)
-			newrelation = heap_open(child_oid, NoLock);
+			newrelation = table_open(child_oid, chunk_lock);
 		else
 			newrelation = oldrelation;
 
@@ -973,11 +1128,11 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, Oid parent_o
 		childrte->securityQuals = NIL;
 		parse->rtable = lappend(parse->rtable, childrte);
 		child_rtindex = list_length(parse->rtable);
+		if (first_chunk_index == 0)
+			first_chunk_index = child_rtindex;
 		root->simple_rte_array[child_rtindex] = childrte;
+#if PG12_LT
 		root->simple_rel_array[child_rtindex] = NULL;
-
-#if PG10_GE
-		Assert(childrte->relkind != RELKIND_PARTITIONED_TABLE);
 #endif
 
 		appinfo = makeNode(AppendRelInfo);
@@ -994,18 +1149,38 @@ ts_plan_expand_hypertable_chunks(Hypertable *ht, PlannerInfo *root, Oid parent_o
 
 		/* Close child relations, but keep locks */
 		if (child_oid != parent_oid)
-			heap_close(newrelation, NoLock);
+			table_close(newrelation, NoLock);
 	}
 
-	heap_close(oldrelation, NoLock);
+	table_close(oldrelation, NoLock);
 
 	root->append_rel_list = list_concat(root->append_rel_list, appinfos);
+
 #if PG11_GE
 	/*
 	 * PG11 introduces a separate array to make looking up children faster, see:
 	 * https://github.com/postgres/postgres/commit/7d872c91a3f9d49b56117557cdbb0c3d4c620687.
 	 */
 	setup_append_rel_array(root);
+#endif
+
+#if PG12_GE
+	/* In pg12 postgres will not set up the child rels for use, due to the games
+	 * we're playing with inheritance, so we must do it ourselves.
+	 * build_simple_rel will look things up in the append_rel_array, so we can
+	 * only use it after that array has been set up.
+	 */
+	i = 0;
+	for (i = 0; i < list_length(inh_oids); i++)
+	{
+		Index child_rtindex = first_chunk_index + i;
+		/* build_simple_rel will add the child to the relarray */
+		RelOptInfo *child_rel = build_simple_rel(root, child_rtindex, rel);
+
+		/* if we're performing partitionwise aggregation, we must populate part_rels */
+		if (rel->part_rels != NULL)
+			rel->part_rels[i] = child_rel;
+	}
 #endif
 }
 
@@ -1107,8 +1282,29 @@ propagate_join_quals(PlannerInfo *root, RelOptInfo *rel, CollectQualCtx *ctx)
 												 NULL);
 #endif
 				ctx->restrictions = lappend(ctx->restrictions, restrictinfo);
+#if PG12_GE
+				/*
+				 * since hypertable expansion happens later in PG12 the propagated
+				 * constraints will not be pushed down to the actual scans but stay
+				 * as join filter. So we add them either as join filter or to
+				 * baserestrictinfo depending on whether they reference only
+				 * the currently processed relation or multiple relations.
+				 */
+				if (bms_num_members(relids) == 1 && bms_is_member(rel->relid, relids))
+				{
+					if (!list_member(rel->baserestrictinfo, restrictinfo))
+						rel->baserestrictinfo = lappend(rel->baserestrictinfo, restrictinfo);
+				}
+				else
+				{
+					root->parse->jointree->quals =
+						(Node *) lappend((List *) root->parse->jointree->quals, propagated);
+				}
+#else
 				root->parse->jointree->quals =
 					(Node *) lappend((List *) root->parse->jointree->quals, propagated);
+
+#endif
 			}
 		}
 	}

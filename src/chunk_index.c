@@ -17,21 +17,25 @@
 #include <utils/fmgroids.h>
 #include <utils/builtins.h>
 #include <nodes/parsenodes.h>
-#include <optimizer/var.h>
 #include <commands/defrem.h>
 #include <commands/tablecmds.h>
 #include <commands/cluster.h>
 #include <access/xact.h>
 #include <miscadmin.h>
 
-#include "export.h"
+#include "compat.h"
+#if PG12_LT
+#include <optimizer/var.h>
+#else
+#include <optimizer/optimizer.h>
+#endif
+
 #include "chunk_index.h"
 #include "hypertable.h"
 #include "hypertable_cache.h"
 #include "catalog.h"
 #include "scanner.h"
 #include "chunk.h"
-#include "compat.h"
 
 static bool chunk_index_insert(int32 chunk_id, const char *chunk_index, int32 hypertable_id,
 							   const char *hypertable_index);
@@ -89,14 +93,20 @@ chunk_index_choose_name(const char *tabname, const char *main_index_name, Oid na
 static void
 adjust_expr_attnos(Oid ht_relid, IndexInfo *ii, Relation chunkrel)
 {
+	List *vars = NIL;
 	ListCell *lc;
 
 	/* Get a list of references to all Vars in the expression */
-	List *vars = pull_var_clause((Node *) ii->ii_Expressions, 0);
+	if (ii->ii_Expressions != NIL)
+		vars = list_concat(vars, pull_var_clause((Node *) ii->ii_Expressions, 0));
+
+	/* Get a list of references to all Vars in the predicate */
+	if (ii->ii_Predicate != NIL)
+		vars = list_concat(vars, pull_var_clause((Node *) ii->ii_Predicate, 0));
 
 	foreach (lc, vars)
 	{
-		Var *var = lfirst(lc);
+		Var *var = lfirst_node(Var, lc);
 
 		char *attname = get_attname_compat(ht_relid, var->varattno, false);
 		var->varattno = get_attnum(chunkrel->rd_id, attname);
@@ -121,7 +131,7 @@ chunk_adjust_colref_attnos(IndexInfo *ii, Relation idxrel, Relation chunkrel)
 
 		if (attno == InvalidAttrNumber)
 			elog(ERROR, "index attribute %s not found in chunk", NameStr(idxattr->attname));
-#if PG96 || PG10
+#if PG11_LT
 		ii->ii_KeyAttrNumbers[i] = attno;
 #else
 		ii->ii_IndexAttrNumbers[i] = attno;
@@ -144,11 +154,13 @@ ts_adjust_indexinfo_attnos(IndexInfo *indexinfo, Oid ht_relid, Relation template
 	 *
 	 * We need to handle two cases: (1) regular indexes that reference columns
 	 * directly, and (2) expression indexes that reference columns in expressions.
+	 *
+	 * Additionally we need to adjust column references in predicates.
 	 */
 	if (list_length(indexinfo->ii_Expressions) == 0)
 		chunk_adjust_colref_attnos(indexinfo, template_indexrel, chunkrel);
-	else
-		adjust_expr_attnos(ht_relid, indexinfo, chunkrel);
+
+	adjust_expr_attnos(ht_relid, indexinfo, chunkrel);
 }
 
 #define CHUNK_INDEX_TABLESPACE_OFFSET 1
@@ -202,26 +214,7 @@ chunk_relation_index_create(Relation htrel, Relation template_indexrel, Relation
 	 * hypertable
 	 */
 	if (chunk_index_need_attnos_adjustment(RelationGetDescr(htrel), RelationGetDescr(chunkrel)))
-	{
-		/*
-		 * Adjust a hypertable's index attribute numbers to match a chunk.
-		 *
-		 * A hypertable's IndexInfo for one of its indexes references the attributes
-		 * (columns) in the hypertable by number. These numbers might not be the same
-		 * for the corresponding attribute in one of its chunks. To be able to use an
-		 * IndexInfo from a hypertable's index to create a corresponding index on a
-		 * chunk, we need to adjust the attribute numbers to match the chunk.
-		 *
-		 * We need to handle two cases: (1) regular indexes that reference columns
-		 * directly, and (2) expression indexes that reference columns in expressions.
-		 */
-		if (list_length(indexinfo->ii_Expressions) == 0)
-			chunk_adjust_colref_attnos(indexinfo, template_indexrel, chunkrel);
-		else
-		{
-			adjust_expr_attnos(htrel->rd_id, indexinfo, chunkrel);
-		}
-	}
+		ts_adjust_indexinfo_attnos(indexinfo, htrel->rd_id, template_indexrel, chunkrel);
 
 	hypertable_id = ts_hypertable_relid_to_id(htrel->rd_id);
 
@@ -336,10 +329,10 @@ chunk_index_insert(int32 chunk_id, const char *chunk_index, int32 hypertable_id,
 	Relation rel;
 	bool result;
 
-	rel = heap_open(catalog_get_table_id(catalog, CHUNK_INDEX), RowExclusiveLock);
+	rel = table_open(catalog_get_table_id(catalog, CHUNK_INDEX), RowExclusiveLock);
 	result =
 		chunk_index_insert_relation(rel, chunk_id, chunk_index, hypertable_id, hypertable_index);
-	heap_close(rel, RowExclusiveLock);
+	table_close(rel, RowExclusiveLock);
 
 	return result;
 }
@@ -450,9 +443,7 @@ ts_chunk_index_create_from_stmt(IndexStmt *stmt, int32 chunk_id, Oid chunkrelid,
 static inline Oid
 chunk_index_get_schemaid(Form_chunk_index chunk_index, bool missing_ok)
 {
-	Chunk *chunk = ts_chunk_get_by_id(chunk_index->chunk_id, 0, true);
-
-	return get_namespace_oid(NameStr(chunk->fd.schema_name), missing_ok);
+	return ts_chunk_get_schema_id(chunk_index->chunk_id, missing_ok);
 }
 
 #define chunk_index_tuple_get_schema(tuple)                                                        \
@@ -470,10 +461,10 @@ ts_chunk_index_create_all(int32 hypertable_id, Oid hypertable_relid, int32 chunk
 	List *indexlist;
 	ListCell *lc;
 
-	htrel = relation_open(hypertable_relid, AccessShareLock);
+	htrel = table_open(hypertable_relid, AccessShareLock);
 
 	/* Need ShareLock on the heap relation we are creating indexes on */
-	chunkrel = relation_open(chunkrelid, ShareLock);
+	chunkrel = table_open(chunkrelid, ShareLock);
 
 	/*
 	 * We should only add those indexes that aren't created from constraints,
@@ -491,7 +482,7 @@ ts_chunk_index_create_all(int32 hypertable_id, Oid hypertable_relid, int32 chunk
 	foreach (lc, indexlist)
 	{
 		Oid hypertable_idxoid = lfirst_oid(lc);
-		Relation hypertable_idxrel = relation_open(hypertable_idxoid, AccessShareLock);
+		Relation hypertable_idxrel = index_open(hypertable_idxoid, AccessShareLock);
 
 		chunk_index_create(htrel,
 						   hypertable_id,
@@ -500,11 +491,11 @@ ts_chunk_index_create_all(int32 hypertable_id, Oid hypertable_relid, int32 chunk
 						   chunkrel,
 						   get_index_constraint(hypertable_idxoid));
 
-		relation_close(hypertable_idxrel, AccessShareLock);
+		index_close(hypertable_idxrel, AccessShareLock);
 	}
 
-	relation_close(chunkrel, NoLock);
-	relation_close(htrel, AccessShareLock);
+	table_close(chunkrel, NoLock);
+	table_close(htrel, AccessShareLock);
 }
 
 static int
@@ -512,7 +503,7 @@ chunk_index_scan(int indexid, ScanKeyData scankey[], int nkeys, tuple_found_func
 				 tuple_filter_func tuple_filter, void *data, LOCKMODE lockmode)
 {
 	Catalog *catalog = ts_catalog_get();
-	ScannerCtx scanCtx = {
+	ScannerCtx scanctx = {
 		.table = catalog_get_table_id(catalog, CHUNK_INDEX),
 		.index = catalog_get_index(catalog, CHUNK_INDEX, indexid),
 		.nkeys = nkeys,
@@ -524,7 +515,7 @@ chunk_index_scan(int indexid, ScanKeyData scankey[], int nkeys, tuple_found_func
 		.scandirection = ForwardScanDirection,
 	};
 
-	return ts_scanner_scan(&scanCtx);
+	return ts_scanner_scan(&scanctx);
 }
 
 #define chunk_index_scan_update(idxid, scankey, nkeys, tuple_found, tuple_filter, data)            \
@@ -534,7 +525,7 @@ static ChunkIndexMapping *
 chunk_index_mapping_from_tuple(TupleInfo *ti, ChunkIndexMapping *cim)
 {
 	FormData_chunk_index *chunk_index = (FormData_chunk_index *) GETSTRUCT(ti->tuple);
-	Chunk *chunk = ts_chunk_get_by_id(chunk_index->chunk_id, 0, true);
+	Chunk *chunk = ts_chunk_get_by_id(chunk_index->chunk_id, true);
 	Oid nspoid_chunk = get_rel_namespace(chunk->table_id);
 	Oid nspoid_hyper = get_rel_namespace(chunk->hypertable_relid);
 
@@ -629,7 +620,7 @@ chunk_index_name_and_schema_filter(TupleInfo *ti, void *data)
 
 	if (namestrcmp(&chunk_index->index_name, cid->index_name) == 0)
 	{
-		Chunk *chunk = ts_chunk_get_by_id(chunk_index->chunk_id, 0, false);
+		Chunk *chunk = ts_chunk_get_by_id(chunk_index->chunk_id, false);
 
 		if (NULL != chunk && namestrcmp(&chunk->fd.schema_name, cid->schema) == 0)
 			return SCAN_INCLUDE;
@@ -649,10 +640,9 @@ chunk_index_name_and_schema_filter(TupleInfo *ti, void *data)
 }
 
 int
-ts_chunk_index_delete(Chunk *chunk, Oid chunk_indexrelid, bool drop_index)
+ts_chunk_index_delete(int32 chunk_id, const char *indexname, bool drop_index)
 {
 	ScanKeyData scankey[2];
-	const char *indexname = get_rel_name(chunk_indexrelid);
 	ChunkIndexDeleteData data = {
 		.drop_index = drop_index,
 	};
@@ -661,7 +651,7 @@ ts_chunk_index_delete(Chunk *chunk, Oid chunk_indexrelid, bool drop_index)
 				Anum_chunk_index_chunk_id_index_name_idx_chunk_id,
 				BTEqualStrategyNumber,
 				F_INT4EQ,
-				Int32GetDatum(chunk->fd.id));
+				Int32GetDatum(chunk_id));
 	ScanKeyInit(&scankey[1],
 				Anum_chunk_index_chunk_id_index_name_idx_index_name,
 				BTEqualStrategyNumber,
@@ -815,7 +805,7 @@ chunk_index_tuple_rename(TupleInfo *ti, void *data)
 		 * If the renaming is for a hypertable index, we also rename all
 		 * corresponding chunk indexes
 		 */
-		Chunk *chunk = ts_chunk_get_by_id(chunk_index->chunk_id, 0, true);
+		Chunk *chunk = ts_chunk_get_by_id(chunk_index->chunk_id, true);
 		Oid chunk_schemaoid = get_namespace_oid(NameStr(chunk->fd.schema_name), false);
 		const char *chunk_index_name =
 			chunk_index_choose_name(NameStr(chunk->fd.table_name), info->newname, chunk_schemaoid);
@@ -826,7 +816,7 @@ chunk_index_tuple_rename(TupleInfo *ti, void *data)
 		namestrcpy(&chunk_index->hypertable_index_name, info->newname);
 
 		/* Rename the chunk index */
-		RenameRelationInternal(chunk_indexrelid, chunk_index_name, false);
+		RenameRelationInternalCompat(chunk_indexrelid, chunk_index_name, false, true);
 	}
 	else
 		namestrcpy(&chunk_index->index_name, info->newname);
@@ -946,11 +936,11 @@ ts_chunk_index_set_tablespace(Hypertable *ht, Oid hypertable_indexrelid, const c
 TSDLLEXPORT void
 ts_chunk_index_mark_clustered(Oid chunkrelid, Oid indexrelid)
 {
-	Relation rel = heap_open(chunkrelid, AccessShareLock);
+	Relation rel = table_open(chunkrelid, AccessShareLock);
 
 	mark_index_clustered(rel, indexrelid, true);
 	CommandCounterIncrement();
-	heap_close(rel, AccessShareLock);
+	table_close(rel, AccessShareLock);
 }
 
 TS_FUNCTION_INFO_V1(ts_chunk_index_clone);
@@ -959,7 +949,7 @@ static Oid
 chunk_index_duplicate_index(Relation hypertable_rel, Chunk *src_chunk, Oid chunk_index_oid,
 							Relation dest_chunk_rel, Oid index_tablespace)
 {
-	Relation chunk_index_rel = relation_open(chunk_index_oid, AccessShareLock);
+	Relation chunk_index_rel = index_open(chunk_index_oid, AccessShareLock);
 	ChunkIndexMapping cim;
 	Oid constraint_oid;
 	Oid new_chunk_indexrelid;
@@ -974,7 +964,7 @@ chunk_index_duplicate_index(Relation hypertable_rel, Chunk *src_chunk, Oid chunk
 													   OidIsValid(constraint_oid),
 													   index_tablespace);
 
-	relation_close(chunk_index_rel, NoLock);
+	index_close(chunk_index_rel, NoLock);
 	return new_chunk_indexrelid;
 }
 
@@ -995,13 +985,12 @@ ts_chunk_index_duplicate(Oid src_chunkrelid, Oid dest_chunkrelid, List **src_ind
 	List *new_index_oids = NIL;
 	Chunk *src_chunk;
 
-	/* TODO lock order? */
-	src_chunk_rel = heap_open(src_chunkrelid, AccessShareLock);
-	dest_chunk_rel = heap_open(dest_chunkrelid, ShareLock);
+	src_chunk_rel = table_open(src_chunkrelid, AccessShareLock);
+	dest_chunk_rel = table_open(dest_chunkrelid, ShareLock);
 
-	src_chunk = ts_chunk_get_by_relid(src_chunkrelid, 0, true);
+	src_chunk = ts_chunk_get_by_relid(src_chunkrelid, true);
 
-	hypertable_rel = heap_open(src_chunk->hypertable_relid, AccessShareLock);
+	hypertable_rel = table_open(src_chunk->hypertable_relid, AccessShareLock);
 
 	index_oids = RelationGetIndexList(src_chunk_rel);
 	foreach (index_elem, index_oids)
@@ -1016,10 +1005,10 @@ ts_chunk_index_duplicate(Oid src_chunkrelid, Oid dest_chunkrelid, List **src_ind
 		new_index_oids = lappend_oid(new_index_oids, new_chunk_indexrelid);
 	}
 
-	heap_close(hypertable_rel, AccessShareLock);
+	table_close(hypertable_rel, AccessShareLock);
 
-	heap_close(dest_chunk_rel, NoLock);
-	heap_close(src_chunk_rel, NoLock);
+	table_close(dest_chunk_rel, NoLock);
+	table_close(src_chunk_rel, NoLock);
 
 	if (src_index_oids != NULL)
 		*src_index_oids = index_oids;
@@ -1040,17 +1029,17 @@ ts_chunk_index_clone(PG_FUNCTION_ARGS)
 	Chunk *chunk;
 	ChunkIndexMapping cim;
 
-	chunk_index_rel = relation_open(chunk_index_oid, AccessShareLock);
+	chunk_index_rel = index_open(chunk_index_oid, AccessShareLock);
 
-	chunk = ts_chunk_get_by_relid(chunk_index_rel->rd_index->indrelid, 0, true);
+	chunk = ts_chunk_get_by_relid(chunk_index_rel->rd_index->indrelid, true);
 	ts_chunk_index_get_by_indexrelid(chunk, chunk_index_oid, &cim);
 
 	ts_hypertable_permissions_check(cim.hypertableoid, GetUserId());
 
-	hypertable_rel = heap_open(cim.hypertableoid, AccessShareLock);
+	hypertable_rel = table_open(cim.hypertableoid, AccessShareLock);
 
 	/* Need ShareLock on the heap relation we are creating indexes on */
-	chunk_rel = heap_open(chunk_index_rel->rd_index->indrelid, ShareLock);
+	chunk_rel = table_open(chunk_index_rel->rd_index->indrelid, ShareLock);
 
 	constraint_oid = get_index_constraint(cim.parent_indexoid);
 
@@ -1060,11 +1049,11 @@ ts_chunk_index_clone(PG_FUNCTION_ARGS)
 													   OidIsValid(constraint_oid),
 													   InvalidOid);
 
-	heap_close(chunk_rel, NoLock);
+	table_close(chunk_rel, NoLock);
 
-	heap_close(hypertable_rel, AccessShareLock);
+	table_close(hypertable_rel, AccessShareLock);
 
-	relation_close(chunk_index_rel, AccessShareLock);
+	index_close(chunk_index_rel, AccessShareLock);
 
 	PG_RETURN_OID(new_chunk_indexrelid);
 }
@@ -1083,17 +1072,17 @@ ts_chunk_index_replace(PG_FUNCTION_ARGS)
 	Oid constraint_oid;
 	char *name;
 
-	index_rel = relation_open(chunk_index_oid_old, ShareLock);
+	index_rel = index_open(chunk_index_oid_old, ShareLock);
 
 	/* check permissions */
-	chunk = ts_chunk_get_by_relid(index_rel->rd_index->indrelid, 0, true);
+	chunk = ts_chunk_get_by_relid(index_rel->rd_index->indrelid, true);
 	ts_chunk_index_get_by_indexrelid(chunk, chunk_index_oid_old, &cim);
 	ts_hypertable_permissions_check(cim.hypertableoid, GetUserId());
 
 	name = pstrdup(RelationGetRelationName(index_rel));
 	constraint_oid = get_index_constraint(chunk_index_oid_old);
 
-	relation_close(index_rel, NoLock);
+	index_close(index_rel, NoLock);
 
 	if (OidIsValid(constraint_oid))
 	{
@@ -1114,7 +1103,7 @@ ts_chunk_index_replace(PG_FUNCTION_ARGS)
 		performDeletion(&idxobj, DROP_RESTRICT, 0);
 	}
 
-	RenameRelationInternal(chunk_index_oid_new, name, false);
+	RenameRelationInternalCompat(chunk_index_oid_new, name, false, true);
 
 	PG_RETURN_VOID();
 }

@@ -140,7 +140,7 @@ execute_reorder_policy(BgwJob *job, reorder_func reorder, bool fast_continue)
 	 * function should translate this to the Oid of the index on the specific
 	 * chunk.
 	 */
-	chunk = ts_chunk_get_by_id(chunk_id, 0, false);
+	chunk = ts_chunk_get_by_id(chunk_id, false);
 	elog(LOG, "reordering chunk %s.%s", chunk->fd.schema_name.data, chunk->fd.table_name.data);
 	reorder(chunk->table_id,
 			get_relname_relid(NameStr(args->fd.hypertable_index_name),
@@ -165,7 +165,7 @@ execute_reorder_policy(BgwJob *job, reorder_func reorder, bool fast_continue)
 commit:
 	if (started)
 		CommitTransactionCommand();
-
+	elog(LOG, "job %d completed reordering", job_id);
 	return true;
 }
 
@@ -182,7 +182,7 @@ get_open_dimension_for_hypertable(Hypertable *ht)
 		 * integer_now function
 		 */
 
-		open_dim = ts_continous_agg_find_integer_now_func_by_materialization_id(mat_id);
+		open_dim = ts_continuous_agg_find_integer_now_func_by_materialization_id(mat_id);
 		if (open_dim == NULL)
 		{
 			elog(ERROR,
@@ -220,8 +220,9 @@ execute_drop_chunks_policy(int32 job_id)
 						job_id)));
 
 	table_relid = ts_hypertable_id_to_relid(args->hypertable_id);
-	hypertable = ts_hypertable_cache_get_cache_and_entry(table_relid, false, &hcache);
+	hypertable = ts_hypertable_cache_get_cache_and_entry(table_relid, CACHE_FLAG_NONE, &hcache);
 	open_dim = get_open_dimension_for_hypertable(hypertable);
+
 	ts_chunk_do_drop_chunks(table_relid,
 							ts_interval_subtract_from_now(&args->older_than, open_dim),
 							(Datum) 0,
@@ -234,7 +235,7 @@ execute_drop_chunks_policy(int32 job_id)
 	);
 
 	ts_cache_release(hcache);
-	elog(LOG, "completed dropping chunks");
+	elog(LOG, "job %d completed dropping chunks", job_id);
 
 	if (started)
 	{
@@ -313,7 +314,7 @@ execute_compress_chunks_policy(BgwJob *job)
 						job_id)));
 
 	table_relid = ts_hypertable_id_to_relid(args->fd.hypertable_id);
-	ht = ts_hypertable_cache_get_cache_and_entry(table_relid, false, &hcache);
+	ht = ts_hypertable_cache_get_cache_and_entry(table_relid, CACHE_FLAG_NONE, &hcache);
 
 	chunkid = get_chunk_to_compress(ht, &args->fd.older_than);
 	if (chunkid == INVALID_CHUNK_ID)
@@ -325,7 +326,7 @@ execute_compress_chunks_policy(BgwJob *job)
 	}
 	else
 	{
-		chunk = ts_chunk_get_by_id(chunkid, 0, true);
+		chunk = ts_chunk_get_by_id(chunkid, true);
 		tsl_compress_chunk_wrapper(chunk->table_id, false);
 		elog(LOG,
 			 "completed compressing chunk %s.%s",
@@ -343,6 +344,7 @@ execute_compress_chunks_policy(BgwJob *job)
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 	}
+	elog(LOG, "job %d completed compressing chunk", job_id);
 	return true;
 }
 

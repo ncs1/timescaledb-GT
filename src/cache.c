@@ -81,7 +81,7 @@ ts_cache_invalidate(Cache *cache)
  * invalidation events (i.e. AcceptInvalidationMessages() may be called).
  *
  * Invalidation messages may be processed on any internal function that takes a
- * lock (e.g. heap_open).
+ * lock (e.g. table_open).
  *
  * Each call to cache_pin MUST BE paired with a call to cache_release.
  *
@@ -152,11 +152,18 @@ ts_cache_memory_ctx(Cache *cache)
 void *
 ts_cache_fetch(Cache *cache, CacheQuery *query)
 {
+	HASHACTION action;
 	bool found;
-	HASHACTION action = cache->create_entry == NULL ? HASH_FIND : HASH_ENTER;
 
-	if (cache->htab == NULL)
-		elog(ERROR, "hash %s is not initialized", cache->name);
+	if (cache->htab == NULL || cache->valid_result == NULL)
+		elog(ERROR, "cache \"%s\" is not initialized", cache->name);
+
+	if (query->flags & CACHE_FLAG_NOCREATE)
+		action = HASH_FIND;
+	else if (cache->create_entry == NULL)
+		elog(ERROR, "cache \"%s\" does not support creating new entries", cache->name);
+	else
+		action = HASH_ENTER;
 
 	query->result = hash_search(cache->htab, cache->get_key(query), action, &found);
 
@@ -171,11 +178,19 @@ ts_cache_fetch(Cache *cache, CacheQuery *query)
 	{
 		cache->stats.misses++;
 
-		if (cache->create_entry != NULL)
+		if (action == HASH_ENTER)
 		{
 			cache->stats.numelements++;
 			query->result = cache->create_entry(cache, query);
 		}
+	}
+
+	if (!(query->flags & CACHE_FLAG_MISSING_OK) && !cache->valid_result(query->result))
+	{
+		if (cache->missing_error != NULL)
+			cache->missing_error(cache, query);
+		else
+			elog(ERROR, "failed to find entry in cache \"%s\"", cache->name);
 	}
 
 	return query->result;

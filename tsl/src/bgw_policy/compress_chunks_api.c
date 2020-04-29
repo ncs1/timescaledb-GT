@@ -74,6 +74,7 @@ compress_chunks_add_policy(PG_FUNCTION_ARGS)
 	Dimension *dim;
 	FormData_ts_interval *older_than;
 	ts_hypertable_permissions_check(ht_oid, GetUserId());
+	Oid owner_id = ts_hypertable_permissions_check(ht_oid, GetUserId());
 
 	older_than = ts_interval_from_sql_input(ht_oid,
 											older_than_datum,
@@ -82,7 +83,7 @@ compress_chunks_add_policy(PG_FUNCTION_ARGS)
 											"compress_chunks_add_policy");
 
 	/* check if this is a table with compression enabled */
-	hypertable = ts_hypertable_cache_get_cache_and_entry(ht_oid, false, &hcache);
+	hypertable = ts_hypertable_cache_get_cache_and_entry(ht_oid, CACHE_FLAG_NONE, &hcache);
 	if (!TS_HYPERTABLE_HAS_COMPRESSION(hypertable))
 	{
 		ts_cache_release(hcache);
@@ -91,6 +92,8 @@ compress_chunks_add_policy(PG_FUNCTION_ARGS)
 				 errmsg("can add compress_chunks policy only on hypertables with compression "
 						"enabled")));
 	}
+
+	ts_bgw_job_validate_job_owner(owner_id, JOB_TYPE_COMPRESS_CHUNKS);
 
 	/* Make sure that an existing policy doesn't exist on this hypertable */
 	existing = ts_bgw_policy_compress_chunks_find_by_hypertable(hypertable->fd.id);

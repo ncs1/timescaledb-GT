@@ -9,9 +9,6 @@
  * Limitations: For now the jobs are only loaded when the scheduler starts and are not
  * updated if the jobs table changes
  *
- * TODO: right now jobs are not prioritized when slots available. Should prioritize in
- * asc next_start order.
- *
  */
 #include <postgres.h>
 
@@ -30,6 +27,7 @@
 #include <access/xact.h>
 #include <pgstat.h>
 #include <tcop/tcopprot.h>
+#include <nodes/pg_list.h>
 
 #include "extension.h"
 #include "guc.h"
@@ -40,8 +38,10 @@
 #include "compat.h"
 #include "timer.h"
 #include "launcher_interface.h"
+#include "compat.h"
 
 #define SCHEDULER_APPNAME "TimescaleDB Background Worker Scheduler"
+#define START_RETRY_MS (1 * INT64CONST(1000)) /* 1 seconds */
 
 static TimestampTz
 least_timestamp(TimestampTz left, TimestampTz right)
@@ -173,6 +173,7 @@ worker_state_cleanup(ScheduledBgwJob *sjob)
 			elog(WARNING,
 				 "scheduler detected that job %d was deleted after job quit",
 				 sjob->job.fd.id);
+			ts_bgw_job_cache_invalidate_callback();
 			sjob->may_need_mark_end = false;
 			return;
 		}
@@ -188,6 +189,7 @@ worker_state_cleanup(ScheduledBgwJob *sjob)
 			 * a signal (cancel or terminate), it won't be able to so we
 			 * should.
 			 */
+			elog(LOG, "job %d failed", sjob->job.fd.id);
 			mark_job_as_ended(sjob, JOB_FAILURE);
 			/* reload updated value */
 			job_stat = ts_bgw_job_stat_find(sjob->job.fd.id);
@@ -226,12 +228,6 @@ scheduled_bgw_job_transition_state_to(ScheduledBgwJob *sjob, JobState new_state)
 
 			job_stat = ts_bgw_job_stat_find(sjob->job.fd.id);
 
-			if (!ts_bgw_job_stat_should_execute(job_stat, &sjob->job))
-			{
-				scheduled_bgw_job_transition_state_to(sjob, JOB_STATE_DISABLED);
-				return;
-			}
-
 			Assert(!sjob->reserved_worker);
 			sjob->next_start = ts_bgw_job_stat_next_start(job_stat, &sjob->job);
 			break;
@@ -247,6 +243,19 @@ scheduled_bgw_job_transition_state_to(ScheduledBgwJob *sjob, JobState new_state)
 				elog(WARNING,
 					 "scheduler detected that job %d was deleted when starting job",
 					 sjob->job.fd.id);
+				ts_bgw_job_cache_invalidate_callback();
+				CommitTransactionCommand();
+				return;
+			}
+
+			/* If we are unable to reserve a worker go back to the scheduled state */
+			sjob->reserved_worker = ts_bgw_worker_reserve();
+			if (!sjob->reserved_worker)
+			{
+				elog(WARNING,
+					 "failed to launch job %d \"%s\": out of background workers",
+					 sjob->job.fd.id,
+					 NameStr(sjob->job.fd.application_name));
 				scheduled_bgw_job_transition_state_to(sjob, JOB_STATE_SCHEDULED);
 				CommitTransactionCommand();
 				return;
@@ -265,17 +274,6 @@ scheduled_bgw_job_transition_state_to(ScheduledBgwJob *sjob, JobState new_state)
 
 			owner_uid = ts_bgw_job_owner(&sjob->job);
 			CommitTransactionCommand();
-
-			sjob->reserved_worker = ts_bgw_worker_reserve();
-			if (!sjob->reserved_worker)
-			{
-				elog(WARNING,
-					 "failed to launch job %d \"%s\": out of background workers",
-					 sjob->job.fd.id,
-					 NameStr(sjob->job.fd.application_name));
-				on_failure_to_start_job(sjob);
-				return;
-			}
 
 			elog(DEBUG1,
 				 "launching job %d \"%s\"",
@@ -309,11 +307,19 @@ on_failure_to_start_job(ScheduledBgwJob *sjob)
 {
 	StartTransactionCommand();
 	if (!ts_bgw_job_get_share_lock(sjob->job.fd.id, CurrentMemoryContext))
+	{
 		elog(WARNING,
 			 "scheduler detected that job %d was deleted while failing to start",
 			 sjob->job.fd.id);
+		ts_bgw_job_cache_invalidate_callback();
+	}
 	else
-		mark_job_as_ended(sjob, JOB_FAILURE);
+	{
+		/* restore the original next_start to maintain priority (it is unset during mark_start) */
+		if (sjob->next_start != DT_NOBEGIN)
+			ts_bgw_job_stat_set_next_start(&sjob->job, sjob->next_start);
+		mark_job_as_ended(sjob, JOB_FAILURE_TO_START);
+	}
 	scheduled_bgw_job_transition_state_to(sjob, JOB_STATE_SCHEDULED);
 	CommitTransactionCommand();
 }
@@ -486,12 +492,31 @@ ts_populate_scheduled_job_tuple(ScheduledBgwJob *sjob, Datum *values)
 }
 #endif
 
+static int
+cmp_next_start(const void *left, const void *right)
+{
+	const ListCell *left_cell = *((ListCell **) left);
+	const ListCell *right_cell = *((ListCell **) right);
+	ScheduledBgwJob *left_sjob = lfirst(left_cell);
+	ScheduledBgwJob *right_sjob = lfirst(right_cell);
+
+	if (left_sjob->next_start < right_sjob->next_start)
+		return -1;
+
+	if (left_sjob->next_start > right_sjob->next_start)
+		return 1;
+
+	return 0;
+}
+
 static void
 start_scheduled_jobs(register_background_worker_callback_type bgw_register)
 {
 	ListCell *lc;
+	/* Order jobs by increasing next_start */
+	List *ordered_scheduled_jobs = list_qsort(scheduled_jobs, cmp_next_start);
 
-	foreach (lc, scheduled_jobs)
+	foreach (lc, ordered_scheduled_jobs)
 	{
 		ScheduledBgwJob *sjob = lfirst(lc);
 
@@ -503,17 +528,25 @@ start_scheduled_jobs(register_background_worker_callback_type bgw_register)
 
 /* Returns the earliest time the scheduler should start a job that is waiting to be started */
 static TimestampTz
-earliest_time_to_start_next_job()
+earliest_wakeup_to_start_next_job()
 {
 	ListCell *lc;
 	TimestampTz earliest = DT_NOEND;
+	TimestampTz now = ts_timer_get_current_timestamp();
 
 	foreach (lc, scheduled_jobs)
 	{
 		ScheduledBgwJob *sjob = lfirst(lc);
 
 		if (sjob->state == JOB_STATE_SCHEDULED)
-			earliest = least_timestamp(earliest, sjob->next_start);
+		{
+			TimestampTz start = sjob->next_start;
+			/* if the start is less than now, this means we tried and failed to start it already, so
+			 * use the retry period */
+			if (start < now)
+				start = TimestampTzPlusMilliseconds(now, START_RETRY_MS);
+			earliest = least_timestamp(earliest, start);
+		}
 	}
 	return earliest;
 }
@@ -664,7 +697,7 @@ ts_bgw_scheduler_process(int32 run_for_interval_ms,
 
 		/* start jobs, and then check when to next wake up */
 		start_scheduled_jobs(bgw_register);
-		next_wakeup = least_timestamp(next_wakeup, earliest_time_to_start_next_job());
+		next_wakeup = least_timestamp(next_wakeup, earliest_wakeup_to_start_next_job());
 		next_wakeup = least_timestamp(next_wakeup, earliest_job_timeout());
 
 		ts_timer_wait(next_wakeup);

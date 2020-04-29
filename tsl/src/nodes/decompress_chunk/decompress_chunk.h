@@ -8,7 +8,6 @@
 
 #include <postgres.h>
 #include <nodes/bitmapset.h>
-#include <nodes/relation.h>
 #include <nodes/extensible.h>
 
 #include "chunk.h"

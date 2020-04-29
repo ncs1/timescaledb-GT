@@ -24,8 +24,17 @@ if [ $EXIT_CODE -ne 0 ]; then
   exit $EXIT_CODE
 fi
 
-TAGS="1.5.0-pg11"
+TAGS="1.5.0-pg11 1.5.1-pg11 1.6.0-pg11 1.6.1-pg11"
 TEST_VERSION="v5-pg11"
+
+TAGS=$TAGS TEST_VERSION=$TEST_VERSION bash ${SCRIPT_DIR}/test_updates.sh
+EXIT_CODE=$?
+if [ $EXIT_CODE -ne 0 ]; then
+  exit $EXIT_CODE
+fi
+
+TAGS="1.7.0-pg11"
+TEST_VERSION="v6-pg11"
 
 TAGS=$TAGS TEST_VERSION=$TEST_VERSION bash ${SCRIPT_DIR}/test_updates.sh
 EXIT_CODE=$?

@@ -101,7 +101,7 @@ ts_interval_from_sql_input(Oid relid, Datum interval, Oid interval_type, const c
 
 	ts_hypertable_permissions_check(relid, GetUserId());
 
-	hypertable = ts_hypertable_cache_get_cache_and_entry(relid, false, &hcache);
+	hypertable = ts_hypertable_cache_get_cache_and_entry(relid, CACHE_FLAG_NONE, &hcache);
 
 	/* validate that the open dimension uses a time type */
 	open_dim = hyperspace_get_open_dimension(hypertable->space, 0);
@@ -374,6 +374,14 @@ ts_get_now_internal(Dimension *open_dim)
 #else
 		Datum now_datum = TimestampTzGetDatum(GetCurrentTimestamp());
 #endif
+
+		/*
+		 * If the type of the partitioning column is TIMESTAMP or DATE
+		 * we need to adjust the return value for the local timezone.
+		 */
+		if (dim_post_part_type == TIMESTAMPOID || dim_post_part_type == DATEOID)
+			now_datum = DirectFunctionCall1(timestamptz_timestamp, now_datum);
+
 		return ts_time_value_to_internal(now_datum, TIMESTAMPTZOID);
 	}
 }

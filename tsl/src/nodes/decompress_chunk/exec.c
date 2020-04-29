@@ -11,13 +11,6 @@
 #include <nodes/bitmapset.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
-#include <nodes/relation.h>
-#include <optimizer/clauses.h>
-#include <optimizer/cost.h>
-#include <optimizer/plancat.h>
-#include <optimizer/predtest.h>
-#include <optimizer/prep.h>
-#include <optimizer/restrictinfo.h>
 #include <parser/parsetree.h>
 #include <rewrite/rewriteManip.h>
 #include <utils/builtins.h>

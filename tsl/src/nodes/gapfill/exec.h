@@ -8,7 +8,6 @@
 
 #include <postgres.h>
 #include <nodes/execnodes.h>
-#include <executor/tuptable.h>
 
 /*
  * GapFillFetchState describes the state of subslot in GapFillState:
@@ -100,7 +99,7 @@ typedef struct GapFillState
 	int64 subslot_time; /* time of tuple in subslot */
 
 	int time_index;			 /* position of time column */
-	TupleTableSlot *subslot; /* TupleTableSlot from subplan */
+	TupleTableSlot *subslot; /* TupleTableSlot storing data from subplan */
 
 	bool multigroup; /* multiple groupings */
 	bool groups_initialized;

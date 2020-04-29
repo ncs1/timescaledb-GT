@@ -100,15 +100,21 @@ CREATE OR REPLACE VIEW timescaledb_information.continuous_aggregates as
         THEN _timescaledb_internal.to_interval(cagg.max_interval_per_job)::TEXT
       ELSE cagg.max_interval_per_job::TEXT
     END AS max_interval_per_job,
-    CASE _timescaledb_internal.get_time_type(cagg.raw_hypertable_id)
-      WHEN 'TIMESTAMP'::regtype
-        THEN _timescaledb_internal.to_interval(cagg.ignore_invalidation_older_than)::TEXT
-      WHEN 'TIMESTAMPTZ'::regtype
-        THEN _timescaledb_internal.to_interval(cagg.ignore_invalidation_older_than)::TEXT
-      WHEN 'DATE'::regtype
-        THEN _timescaledb_internal.to_interval(cagg.ignore_invalidation_older_than)::TEXT
-      ELSE cagg.ignore_invalidation_older_than::TEXT
+    CASE
+      WHEN cagg.ignore_invalidation_older_than = BIGINT '9223372036854775807'
+        THEN NULL
+      ELSE
+	CASE _timescaledb_internal.get_time_type(cagg.raw_hypertable_id)
+          WHEN 'TIMESTAMP'::regtype
+            THEN _timescaledb_internal.to_interval(cagg.ignore_invalidation_older_than)::TEXT
+          WHEN 'TIMESTAMPTZ'::regtype
+            THEN _timescaledb_internal.to_interval(cagg.ignore_invalidation_older_than)::TEXT
+          WHEN 'DATE'::regtype
+            THEN _timescaledb_internal.to_interval(cagg.ignore_invalidation_older_than)::TEXT
+          ELSE cagg.ignore_invalidation_older_than::TEXT
+        END
     END AS ignore_invalidation_older_than,
+    cagg.materialized_only,
     format('%1$I.%2$I', ht.schema_name, ht.table_name)::regclass as materialization_hypertable,
     directview.viewdefinition as view_definition
   FROM  _timescaledb_catalog.continuous_agg cagg,
@@ -149,14 +155,17 @@ CREATE OR REPLACE VIEW timescaledb_information.continuous_aggregate_stats as
     cagg.job_id as job_id,
     bgw_job_stat.last_start as last_run_started_at,
     bgw_job_stat.last_successful_finish as last_successful_finish,
-    CASE when bgw_job_stat.last_run_success = 't' then 'Success'
-         when bgw_job_stat.last_run_success = 'f' then 'Failed'
-    END AS last_run_status,
-    case when bgw_job_stat.last_finish < '4714-11-24 00:00:00+00 BC' then 'running'
-       when bgw_job_stat.next_start is not null then 'scheduled'
-    end as job_status,
-    case when bgw_job_stat.last_finish > bgw_job_stat.last_start then (bgw_job_stat.last_finish - bgw_job_stat.last_start)
-    end as last_run_duration,
+    CASE WHEN bgw_job_stat.last_finish < '4714-11-24 00:00:00+00 BC' THEN NULL 
+         WHEN bgw_job_stat.last_finish IS NOT NULL THEN
+              CASE WHEN bgw_job_stat.last_run_success = 't' THEN 'Success'
+                   WHEN bgw_job_stat.last_run_success = 'f' THEN 'Failed'
+              END
+    END as last_run_status,
+    CASE WHEN bgw_job_stat.last_finish < '4714-11-24 00:00:00+00 BC' THEN 'Running'
+       WHEN bgw_job_stat.next_start IS NOT NULL THEN 'Scheduled'
+    END as job_status,
+    CASE WHEN bgw_job_stat.last_finish > bgw_job_stat.last_start THEN (bgw_job_stat.last_finish - bgw_job_stat.last_start)
+    END as last_run_duration,
     bgw_job_stat.next_start as next_scheduled_run,
     bgw_job_stat.total_runs,
     bgw_job_stat.total_successes,
@@ -197,7 +206,7 @@ WITH mapq as
   mapq.compressed_toast_bytes,
   mapq.compressed_total_bytes
   FROM _timescaledb_catalog.hypertable as srcht JOIN _timescaledb_catalog.chunk as srcch
-  ON srcht.id = srcch.hypertable_id and srcht.compressed_hypertable_id IS NOT NULL
+  ON srcht.id = srcch.hypertable_id and srcht.compressed_hypertable_id IS NOT NULL and srcch.dropped = false
   LEFT JOIN mapq
   ON srcch.id = mapq.chunk_id ;
 

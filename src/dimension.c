@@ -629,7 +629,7 @@ dimension_insert(int32 hypertable_id, Name colname, Oid coltype, int16 num_slice
 	Relation rel;
 	int32 dimension_id;
 
-	rel = heap_open(catalog_get_table_id(catalog, DIMENSION), RowExclusiveLock);
+	rel = table_open(catalog_get_table_id(catalog, DIMENSION), RowExclusiveLock);
 	dimension_id = dimension_insert_relation(rel,
 											 hypertable_id,
 											 colname,
@@ -637,7 +637,7 @@ dimension_insert(int32 hypertable_id, Name colname, Oid coltype, int16 num_slice
 											 num_slices,
 											 partitioning_func,
 											 interval_length);
-	heap_close(rel, RowExclusiveLock);
+	table_close(rel, RowExclusiveLock);
 	return dimension_id;
 }
 
@@ -688,10 +688,11 @@ ts_dimension_set_chunk_interval(Dimension *dim, int64 chunk_interval)
  * the restype parameter.
  */
 Datum
-ts_dimension_transform_value(Dimension *dim, Datum value, Oid const_datum_type, Oid *restype)
+ts_dimension_transform_value(Dimension *dim, Oid collation, Datum value, Oid const_datum_type,
+							 Oid *restype)
 {
 	if (NULL != dim->partitioning)
-		value = ts_partitioning_func_apply(dim->partitioning, value);
+		value = ts_partitioning_func_apply(dim->partitioning, collation, value);
 
 	if (NULL != restype)
 	{
@@ -718,7 +719,7 @@ point_create(int16 num_dimensions)
 }
 
 TSDLLEXPORT Point *
-ts_hyperspace_calculate_point(Hyperspace *hs, HeapTuple tuple, TupleDesc tupdesc)
+ts_hyperspace_calculate_point(Hyperspace *hs, TupleTableSlot *slot)
 {
 	Point *p = point_create(hs->num_dimensions);
 	int i;
@@ -731,9 +732,9 @@ ts_hyperspace_calculate_point(Hyperspace *hs, HeapTuple tuple, TupleDesc tupdesc
 		Oid dimtype;
 
 		if (NULL != d->partitioning)
-			datum = ts_partitioning_func_apply_tuple(d->partitioning, tuple, tupdesc, &isnull);
+			datum = ts_partitioning_func_apply_slot(d->partitioning, slot, &isnull);
 		else
-			datum = heap_getattr(tuple, d->column_attno, tupdesc, &isnull);
+			datum = slot_getattr(slot, d->column_attno, &isnull);
 
 		switch (d->type)
 		{
@@ -938,7 +939,7 @@ ts_dimension_update(Oid table_relid, Name dimname, DimensionType dimtype, Datum 
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid dimension type")));
 
-	ht = ts_hypertable_cache_get_cache_and_entry(table_relid, false, &hcache);
+	ht = ts_hypertable_cache_get_cache_and_entry(table_relid, CACHE_FLAG_NONE, &hcache);
 
 	if (NULL == dimname)
 	{
@@ -1198,6 +1199,23 @@ ts_dimension_info_validate(DimensionInfo *info)
 
 	info->set_not_null = !DatumGetBool(datum);
 
+	/* PG12 check that the column is not generated */
+#if PG12_GE
+	{
+		bool isgenerated;
+
+		datum = SysCacheGetAttr(ATTNAME, tuple, Anum_pg_attribute_attgenerated, &isnull);
+		Assert(!isnull);
+		isgenerated = (DatumGetChar(datum) == ATTRIBUTE_GENERATED_STORED);
+
+		if (isgenerated)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("invalid partitioning column"),
+					 errhint("Generated columns cannot be used as partitioning dimensions.")));
+	}
+#endif
+
 	ReleaseSysCache(tuple);
 
 	if (NULL != info->ht)
@@ -1339,7 +1357,7 @@ ts_dimension_add(PG_FUNCTION_ARGS)
 				 errmsg("could not lock hypertable \"%s\" for update",
 						get_rel_name(info.table_relid))));
 
-	info.ht = ts_hypertable_cache_get_cache_and_entry(info.table_relid, false, &hcache);
+	info.ht = ts_hypertable_cache_get_cache_and_entry(info.table_relid, CACHE_FLAG_NONE, &hcache);
 
 	if (info.num_slices_is_set && OidIsValid(info.interval_type))
 		ereport(ERROR,

@@ -6,31 +6,41 @@
 #ifndef TIMESCALEDB_COMPAT_H
 #define TIMESCALEDB_COMPAT_H
 
+#include <commands/trigger.h>
 #include <postgres.h>
 #include <pgstat.h>
 #include <utils/lsyscache.h>
+#include <utils/rel.h>
 #include <executor/executor.h>
 #include <executor/tuptable.h>
 #include <nodes/execnodes.h>
 #include <nodes/nodes.h>
 
 #include "export.h"
-#include "planner_import.h"
+#include "import/planner.h"
 
 #define is_supported_pg_version_96(version) ((version >= 90603) && (version < 100000))
 #define is_supported_pg_version_10(version) ((version >= 100002) && (version < 110000))
 #define is_supported_pg_version_11(version) ((version >= 110000) && (version < 120000))
+#define is_supported_pg_version_12(version) ((version >= 120000) && (version < 130000))
+
 #define is_supported_pg_version(version)                                                           \
 	(is_supported_pg_version_96(version) || is_supported_pg_version_10(version) ||                 \
-	 is_supported_pg_version_11(version))
+	 is_supported_pg_version_11(version) || is_supported_pg_version_12(version))
 
 #define PG96 is_supported_pg_version_96(PG_VERSION_NUM)
 #define PG10 is_supported_pg_version_10(PG_VERSION_NUM)
 #define PG11 is_supported_pg_version_11(PG_VERSION_NUM)
+#define PG12 is_supported_pg_version_12(PG_VERSION_NUM)
+
 #define PG10_LT PG96
 #define PG10_GE !(PG10_LT)
+
 #define PG11_LT (PG96 || PG10)
 #define PG11_GE !(PG11_LT)
+
+#define PG12_LT (PG96 || PG10 || PG11)
+#define PG12_GE !(PG12_LT)
 
 #if !(is_supported_pg_version(PG_VERSION_NUM))
 #error "Unsupported PostgreSQL version"
@@ -67,7 +77,7 @@
  * will only be activated in versions >=11 when we implement partition-wise
  * joins.
  */
-#if PG96 || PG10
+#if PG11_LT
 #define adjust_appendrel_attrs_compat adjust_appendrel_attrs
 #else
 #define adjust_appendrel_attrs_compat(root, node, appinfo)                                         \
@@ -81,7 +91,7 @@
  * PG11 introduced flags to BackgroundWorker connection functions. PG96 & 10
  * interface kept for backwards compatibility.
  */
-#if PG96 || PG10
+#if PG11_LT
 #define BackgroundWorkerInitializeConnectionByOidCompat(dboid, useroid)                            \
 	BackgroundWorkerInitializeConnectionByOid(dboid, useroid)
 #define BackgroundWorkerInitializeConnectionCompat(dbname, username)                               \
@@ -129,7 +139,7 @@
  * https://github.com/postgres/postgres/commit/17b7c302b5fc92bd0241c452599019e18df074dc
  * we use the PG11 version as it is more descriptive.
  */
-#if PG96 || PG10
+#if PG11_LT
 #define ConstraintRelidTypidNameIndexId ConstraintRelidIndexId
 #endif
 
@@ -142,7 +152,7 @@
  * with it separately, we instead maintain backwards compatibility for the old
  * interface and continue to manage as before.
  */
-#if PG96 || PG10
+#if PG11_LT
 #define CreateTriggerCompat CreateTrigger
 #else
 #define CreateTriggerCompat(stmt,                                                                  \
@@ -220,13 +230,47 @@
 	DefineRelation(stmt, relkind, ownerid, typaddress, queryString)
 #endif
 
+#if PG12_GE
+#define ExecInsertIndexTuplesCompat(slot, estate, no_dup_err, spec_conflict, arbiter_indexes)      \
+	ExecInsertIndexTuples(slot, estate, no_dup_err, spec_conflict, arbiter_indexes);
+#else
+#define ExecInsertIndexTuplesCompat(slot, estate, no_dup_err, spec_conflict, arbiter_indexes)      \
+	ExecInsertIndexTuples(slot,                                                                    \
+						  &((slot)->tts_tuple->t_self),                                            \
+						  estate,                                                                  \
+						  no_dup_err,                                                              \
+						  spec_conflict,                                                           \
+						  arbiter_indexes)
+#endif
+
 /* ExecARInsertTriggers */
 #if PG96
-#define ExecARInsertTriggersCompat(estate, result_rel_info, tuple, recheck_indexes)                \
-	ExecARInsertTriggers(estate, result_rel_info, tuple, recheck_indexes)
+#define ExecARInsertTriggersCompat(estate, relinfo, slot, recheck_indexes, transition_capture)     \
+	do                                                                                             \
+	{                                                                                              \
+		bool should_free;                                                                          \
+		HeapTuple tuple = ExecFetchSlotHeapTuple(slot, true, &should_free);                        \
+		ExecARInsertTriggers(estate, relinfo, tuple, recheck_indexes);                             \
+		if (should_free)                                                                           \
+			heap_freetuple(tuple);                                                                 \
+	} while (0);
+#elif PG12_LT
+#define ExecARInsertTriggersCompat(estate, relinfo, slot, recheck_indexes, transition_capture)     \
+	do                                                                                             \
+	{                                                                                              \
+		bool should_free;                                                                          \
+		HeapTuple tuple = ExecFetchSlotHeapTuple(slot, true, &should_free);                        \
+		ExecARInsertTriggers(estate, relinfo, tuple, recheck_indexes, transition_capture);         \
+		if (should_free)                                                                           \
+			heap_freetuple(tuple);                                                                 \
+	} while (0);
 #else
-#define ExecARInsertTriggersCompat(estate, result_rel_info, tuple, recheck_indexes)                \
-	ExecARInsertTriggers(estate, result_rel_info, tuple, recheck_indexes, NULL)
+#define ExecARInsertTriggersCompat(estate,                                                         \
+								   result_rel_info,                                                \
+								   tuple,                                                          \
+								   recheck_indexes,                                                \
+								   transition_capture)                                             \
+	ExecARInsertTriggers(estate, result_rel_info, tuple, recheck_indexes, transition_capture)
 #endif
 
 /* ExecASInsertTriggers */
@@ -238,6 +282,11 @@
 	ExecASInsertTriggers(estate, result_rel_info, NULL)
 #endif
 
+/* execute_attr_map_tuple */
+#if PG12_LT
+#define execute_attr_map_tuple do_convert_tuple
+#endif
+
 /* ExecBuildProjectionInfo */
 #if PG96
 #define ExecBuildProjectionInfoCompat(tl, exprContext, slot, parent, inputdesc)                    \
@@ -245,6 +294,36 @@
 #else
 #define ExecBuildProjectionInfoCompat(tl, exprContext, slot, parent, inputdesc)                    \
 	ExecBuildProjectionInfo(tl, exprContext, slot, parent, inputdesc)
+#endif
+
+#if PG12_LT
+#define TM_Result HTSU_Result
+
+#define TM_Ok HeapTupleMayBeUpdated
+#define TM_SelfModified HeapTupleSelfUpdated
+#define TM_Updated HeapTupleUpdated
+#define TM_BeingModified HeapTupleBeingUpdated
+#define TM_WouldBlock HeapTupleWouldBlock
+#define TM_Invisible HeapTupleInvisible
+
+#define TM_FailureData HeapUpdateFailureData
+#endif
+
+#if PG12_LT
+
+#define TupleTableSlotOps void
+#define TTSOpsVirtualP NULL
+#define TTSOpsHeapTupleP NULL
+#define TTSOpsMinimalTupleP NULL
+#define TTSOpsBufferHeapTupleP NULL
+
+#else
+
+#define TTSOpsVirtualP (&TTSOpsVirtual)
+#define TTSOpsHeapTupleP (&TTSOpsHeapTuple)
+#define TTSOpsMinimalTupleP (&TTSOpsMinimalTuple)
+#define TTSOpsBufferHeapTupleP (&TTSOpsBufferHeapTuple)
+
 #endif
 
 /*
@@ -257,9 +336,10 @@
  * https://github.com/postgres/postgres/commit/ad7dbee368a7cd9e595d2a957be784326b08c943).
  * We adopt the PG11 conventions so that we can take advantage of JITing more easily in the future.
  */
-#if PG96 || PG10
+#if PG11_LT
+
 static inline TupleTableSlot *
-ExecInitExtraTupleSlotCompat(EState *estate, TupleDesc tupdesc)
+ExecInitExtraTupleSlotCompat(EState *estate, TupleDesc tupdesc, void *tts_ops)
 {
 	TupleTableSlot *myslot = ExecInitExtraTupleSlot(estate);
 
@@ -269,16 +349,16 @@ ExecInitExtraTupleSlotCompat(EState *estate, TupleDesc tupdesc)
 	return myslot;
 }
 
+#define MakeSingleTupleTableSlotCompat(tupledesc, tts_ops) MakeSingleTupleTableSlot(tupledesc)
+
 /*
  * ExecSetTupleBound is only available starting with PG11 so we map to a backported version
  * for PG9.6 and PG10
  */
-#if PG96 || PG10
 #define ExecSetTupleBound(tuples_needed, child_node) ts_ExecSetTupleBound(tuples_needed, child_node)
-#endif
 
 static inline TupleTableSlot *
-MakeTupleTableSlotCompat(TupleDesc tupdesc)
+MakeTupleTableSlotCompat(TupleDesc tupdesc, void *tts_ops)
 {
 	TupleTableSlot *myslot = MakeTupleTableSlot();
 
@@ -287,9 +367,86 @@ MakeTupleTableSlotCompat(TupleDesc tupdesc)
 
 	return myslot;
 }
+#elif PG11
+
+#define ExecInitExtraTupleSlotCompat(estate, tupledesc, tts_ops)                                   \
+	ExecInitExtraTupleSlot(estate, tupledesc)
+#define MakeTupleTableSlotCompat(tupdesc, tts_ops) MakeTupleTableSlot(tupdesc)
+#define MakeSingleTupleTableSlotCompat(tupdesc, tts_ops) MakeSingleTupleTableSlot(tupdesc)
+
+#else /* PG12_GE */
+
+#define ExecInitExtraTupleSlotCompat(estate, tupdesc, tts_ops)                                     \
+	ExecInitExtraTupleSlot(estate, tupdesc, tts_ops)
+#define MakeTupleTableSlotCompat(tupdesc, tts_ops) MakeTupleTableSlot(tupdesc, tts_ops)
+#define MakeSingleTupleTableSlotCompat(tupdesc, tts_ops) MakeSingleTupleTableSlot(tupdesc, tts_ops)
+
+#endif
+
+/* fmgr
+ * In a9c35cf postgres changed how it calls SQL functions so that the number of
+ * argument-slots allocated is chosen dynamically, instead of being fixed. This
+ * change was ABI-breaking, so we cannot backport this optimization, however,
+ * we do backport the interface, so that all our code will be compatible with
+ * new versions.
+ */
+#if PG12_LT
+
+/* unlike the pg12 version, this is just a wrapper for FunctionCallInfoData */
+#define LOCAL_FCINFO(name, nargs)                                                                  \
+	union                                                                                          \
+	{                                                                                              \
+		FunctionCallInfoData fcinfo;                                                               \
+	} name##data;                                                                                  \
+	FunctionCallInfo name = &name##data.fcinfo
+
+/* convenience macro to allocate FunctionCallInfoData on the heap */
+#define HEAP_FCINFO(nargs) palloc(sizeof(FunctionCallInfoData))
+
+/* getting arguments has a different API, so these macros unify the versions */
+#define FC_ARG(fcinfo, n) ((fcinfo)->arg[(n)])
+#define FC_NULL(fcinfo, n) ((fcinfo)->argnull[(n)])
+
 #else
-#define ExecInitExtraTupleSlotCompat ExecInitExtraTupleSlot
-#define MakeTupleTableSlotCompat MakeTupleTableSlot
+
+/* convenience macro to allocate FunctionCallInfoData on the heap */
+#define HEAP_FCINFO(nargs) palloc(SizeForFunctionCallInfo(nargs))
+
+/* getting arguments has a different API, so these macros unify the versions */
+#define FC_ARG(fcinfo, n) ((fcinfo)->args[(n)].value)
+#define FC_NULL(fcinfo, n) ((fcinfo)->args[(n)].isnull)
+
+#endif
+
+/* convenience setters */
+#define FC_SET_ARG(fcinfo, n, val)                                                                 \
+	do                                                                                             \
+	{                                                                                              \
+		short _n = (n);                                                                            \
+		FunctionCallInfo _fcinfo = (fcinfo);                                                       \
+		FC_ARG(_fcinfo, _n) = (val);                                                               \
+		FC_NULL(_fcinfo, _n) = false;                                                              \
+	} while (0)
+
+#define FC_SET_NULL(fcinfo, n)                                                                     \
+	do                                                                                             \
+	{                                                                                              \
+		short _n = (n);                                                                            \
+		FunctionCallInfo _fcinfo = (fcinfo);                                                       \
+		FC_ARG(_fcinfo, _n) = 0;                                                                   \
+		FC_NULL(_fcinfo, _n) = true;                                                               \
+	} while (0)
+
+/*
+ * In PG12 OID columns were removed changing all OID columns in the catalog to
+ * be regular columns. This necessitates passing in the attnum of said column to
+ * any function that wishes to access these columns. In earlier versions, this
+ * parameter can be safely ignored.
+ */
+#if PG12_LT
+#define GetSysCacheOid2Compat(cacheId, oidcol, key1, key2) GetSysCacheOid2(cacheId, key1, key2)
+#else
+#define GetSysCacheOid2Compat GetSysCacheOid2
 #endif
 
 /*
@@ -300,7 +457,7 @@ MakeTupleTableSlotCompat(TupleDesc tupdesc)
  * compatibility here and have a small static inline function to replicate the
  * behavior on older versions.
  */
-#if PG96 || PG10
+#if PG11_LT
 static inline char *
 get_attname_compat(Oid relid, AttrNumber attnum, bool missing_ok)
 {
@@ -333,7 +490,7 @@ get_attname_compat(Oid relid, AttrNumber attnum, bool missing_ok)
  * can be null for pg_catalog tables, but must be provided otherwise), and
  * simply omit in earlier versions.
  */
-#if PG96 || PG10
+#if PG11_LT
 #define heap_attisnull_compat(tup, attnum, tupledesc) heap_attisnull(tup, attnum)
 #else
 #define heap_attisnull_compat heap_attisnull
@@ -352,7 +509,7 @@ get_attname_compat(Oid relid, AttrNumber attnum, bool missing_ok)
  * by us, we might in the future want to use some of those flags depending on how
  * we eventually decide to work with declarative partitioning.
  */
-#if PG96 || PG10
+#if PG11_LT
 /* Index flags */
 #define INDEX_CREATE_IS_PRIMARY (1 << 0)
 #define INDEX_CREATE_ADD_CONSTRAINT (1 << 1)
@@ -499,7 +656,7 @@ get_attname_compat(Oid relid, AttrNumber attnum, bool missing_ok)
  *
  * PG11 added a unit parameter to ExplainPropertyInteger
  */
-#if PG96 || PG10
+#if PG11_LT
 #define ExplainPropertyIntegerCompat(label, unit, value, es)                                       \
 	ExplainPropertyInteger(label, value, es)
 #else
@@ -522,7 +679,7 @@ get_attname_compat(Oid relid, AttrNumber attnum, bool missing_ok)
  * PG11 fixes some functions that return pointers to follow convention and end
  * with P.
  */
-#if PG96 || PG10
+#if PG11_LT
 #define PG_RETURN_JSONB_P PG_RETURN_JSONB
 #endif
 
@@ -534,14 +691,14 @@ get_attname_compat(Oid relid, AttrNumber attnum, bool missing_ok)
  * are nested.
  */
 
-#if PG96 || PG10
-#define ResultRelInfo_OnConflictProjInfoCompat(rri) ((rri)->ri_onConflictSetProj)
-#define ResultRelInfo_OnConflictWhereCompat(rri) ((rri)->ri_onConflictSetWhere)
+#if PG11_LT
+#define ResultRelInfo_OnConflictProjInfoCompat(rri) (rri)->ri_onConflictSetProj
+#define ResultRelInfo_OnConflictWhereCompat(rri) (rri)->ri_onConflictSetWhere
 #define ResultRelInfo_OnConflictNotNull(rri) true
 #else
-#define ResultRelInfo_OnConflictProjInfoCompat(rri) ((rri)->ri_onConflict->oc_ProjInfo)
-#define ResultRelInfo_OnConflictWhereCompat(rri) ((rri)->ri_onConflict->oc_WhereClause)
-#define ResultRelInfo_OnConflictNotNull(rri) ((rri)->ri_onConflict != NULL)
+#define ResultRelInfo_OnConflictProjInfoCompat(rri) (rri)->ri_onConflict->oc_ProjInfo
+#define ResultRelInfo_OnConflictWhereCompat(rri) (rri)->ri_onConflict->oc_WhereClause
+#define ResultRelInfo_OnConflictNotNull(rri) (rri)->ri_onConflict != NULL
 #endif
 
 /* RangeVarGetRelidExtended
@@ -551,7 +708,7 @@ get_attname_compat(Oid relid, AttrNumber attnum, bool missing_ok)
  * https://github.com/postgres/postgres/commit/d87510a524f36a630cfb34cc392e95e959a1b0dc) We do not
  * define RVR_SKIP_LOCKED as cannot yet emulate it
  */
-#if PG96 || PG10
+#if PG11_LT
 #define RVR_MISSING_OK (1 << 0)
 #define RVR_NOWAIT (1 << 1)
 #define RangeVarGetRelidExtendedCompat(relation, lockmode, flags, callback, callback_arg)          \
@@ -565,6 +722,15 @@ get_attname_compat(Oid relid, AttrNumber attnum, bool missing_ok)
 #define RangeVarGetRelidExtendedCompat RangeVarGetRelidExtended
 #endif
 
+/* RenameRelationInternal
+ */
+#if PG12_LT
+#define RenameRelationInternalCompat(relid, name, is_internal, is_index)                           \
+	RenameRelationInternal(relid, name, is_internal)
+#else
+#define RenameRelationInternalCompat RenameRelationInternal
+#endif
+
 /*
  * TransactionChain -> TransactionBlock
  *
@@ -574,7 +740,7 @@ get_attname_compat(Oid relid, AttrNumber attnum, bool missing_ok)
  * use one of the functions in this family, but making this general in case we
  * use the others in the future).
  */
-#if PG96 || PG10
+#if PG11_LT
 #define PreventInTransactionBlock PreventTransactionChain
 #endif
 
@@ -598,13 +764,28 @@ extern int oid_cmp(const void *p1, const void *p2);
 	WaitLatch(latch, wakeEvents, timeout, PG_WAIT_EXTENSION)
 #endif
 
+/* create_merge_append_path */
+#if PG96
+#define create_merge_append_path_compat(root, rel, merge_childs, pathkeys, subpath)                \
+	create_merge_append_path(root, rel, merge_childs, pathkeys, subpath)
+#else
+#define create_merge_append_path_compat(root, rel, merge_childs, pathkeys, subpath)                \
+	create_merge_append_path(root, rel, merge_childs, pathkeys, subpath, NIL)
+#endif
+
 /* pq_sendint is deprecated in PG11, so create pq_sendint32 in 9.6 and 10 */
-#if PG96 || PG10
+#if PG11_LT
 #define pq_sendint32(buf, i) pq_sendint(buf, i, 4)
 #endif
 
 /* create this function for symmetry with above */
 #define pq_getmsgint32(buf) pq_getmsgint(buf, 4)
+
+#if PG12_LT
+#define TUPLE_DESC_HAS_OIDS(desc) (desc)->tdhasoid
+#else
+#define TUPLE_DESC_HAS_OIDS(desc) false
+#endif
 
 #if PG96
 #if __GNUC__ >= 3
@@ -614,6 +795,22 @@ extern int oid_cmp(const void *p1, const void *p2);
 #define likely(x) ((x) != 0)
 #define unlikely(x) ((x) != 0)
 #endif
+#endif
+
+/* Compatibility functions for table access method API introduced in PG12 */
+#if PG12_LT
+#include "compat/tupconvert.h"
+#include "compat/tuptable.h"
+#include "compat/tableam.h"
+
+#else
+#define ts_tuptableslot_set_table_oid(slot, table_oid) (slot)->tts_tableOid = table_oid
+#endif
+
+#if PG12_GE
+#define ExecTypeFromTLCompat(tlist, hasoid) ExecTypeFromTL(tlist)
+#else
+#define ExecTypeFromTLCompat(tlist, hasoid) ExecTypeFromTL(tlist, hasoid)
 #endif
 
 /* backport pg_add_s64_overflow/pg_sub_s64_overflow */
@@ -675,5 +872,112 @@ pg_sub_s64_overflow(int64 a, int64 b, int64 *result)
 #endif
 }
 #endif
+
+/* Backport of list_qsort() */
+#if PG11_LT
+typedef int (*list_qsort_comparator)(const void *a, const void *b);
+/*
+ * Sort a list as though by qsort.
+ *
+ * A new list is built and returned.  Like list_copy, this doesn't make
+ * fresh copies of any pointed-to data.
+ *
+ * The comparator function receives arguments of type ListCell **.
+ */
+
+static List *
+new_list(NodeTag type)
+{
+	List *new_list;
+	ListCell *new_head;
+
+	new_head = (ListCell *) palloc(sizeof(*new_head));
+	new_head->next = NULL;
+	/* new_head->data is left undefined! */
+
+	new_list = (List *) palloc(sizeof(*new_list));
+	new_list->type = type;
+	new_list->length = 1;
+	new_list->head = new_head;
+	new_list->tail = new_head;
+
+	return new_list;
+}
+
+static inline List *
+list_qsort(const List *list, list_qsort_comparator cmp)
+{
+	int len = list_length(list);
+	ListCell **list_arr;
+	List *newlist;
+	ListCell *newlist_prev;
+	ListCell *cell;
+	int i;
+
+	/* Empty list is easy */
+	if (len == 0)
+		return NIL;
+
+	/* Flatten list cells into an array, so we can use qsort */
+	list_arr = (ListCell **) palloc(sizeof(ListCell *) * len);
+	i = 0;
+	foreach (cell, list)
+		list_arr[i++] = cell;
+
+	qsort(list_arr, len, sizeof(ListCell *), cmp);
+
+	/* Construct new list (this code is much like list_copy) */
+	newlist = new_list(list->type);
+	newlist->length = len;
+
+	/*
+	 * Copy over the data in the first cell; new_list() has already allocated
+	 * the head cell itself
+	 */
+	newlist->head->data = list_arr[0]->data;
+
+	newlist_prev = newlist->head;
+	for (i = 1; i < len; i++)
+	{
+		ListCell *newlist_cur;
+
+		newlist_cur = (ListCell *) palloc(sizeof(*newlist_cur));
+		newlist_cur->data = list_arr[i]->data;
+		newlist_prev->next = newlist_cur;
+
+		newlist_prev = newlist_cur;
+	}
+
+	newlist_prev->next = NULL;
+	newlist->tail = newlist_prev;
+
+	/* Might as well free the workspace array */
+	pfree(list_arr);
+
+	return newlist;
+}
+
+#endif
+
+/*
+ * ForeignKeyCacheInfo doesn't contain the constraint Oid in early versions.
+ * This is a fix for PG10 and PG96 until support for them is gone.
+ */
+#if PG11_LT
+#define RelationGetFKeyListCompat(rel) ts_relation_get_fk_list(rel)
+#define T_ForeignKeyCacheInfoCompat T_ForeignKeyCacheInfo
+typedef struct ForeignKeyCacheInfoCompat
+{
+	ForeignKeyCacheInfo base;
+	Oid conoid;
+} ForeignKeyCacheInfoCompat;
+/* No need to copy FK list, since custom implementation doesn't use cache. */
+#define copy_fk_list_from_cache(l) l
+#else
+#define RelationGetFKeyListCompat(rel) RelationGetFKeyList(rel)
+#define ForeignKeyCacheInfoCompat ForeignKeyCacheInfo
+/* Copies FK list, since the cache can be invalidated. */
+#define copy_fk_list_from_cache(l) copyObject(l)
+#endif /* PG11_LT */
 
 #endif /* TIMESCALEDB_COMPAT_H */

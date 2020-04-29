@@ -8,8 +8,6 @@
 #define TIMESCALEDB_DECOMPRESS_CHUNK_PLANNER_H
 
 #include <postgres.h>
-#include <nodes/extensible.h>
-#include <nodes/relation.h>
 
 extern Plan *decompress_chunk_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 										  List *tlist, List *clauses, List *custom_plans);

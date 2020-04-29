@@ -8,7 +8,6 @@
 
 #include <postgres.h>
 #include <nodes/extensible.h>
-#include <nodes/relation.h>
 
 Plan *ts_chunk_append_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path, List *tlist,
 								  List *clauses, List *custom_plans);

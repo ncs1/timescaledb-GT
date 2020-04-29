@@ -60,6 +60,11 @@ static const WithClauseDefinition continuous_aggregate_with_clause_def[] = {
 			.arg_name = "ignore_invalidation_older_than",
 			.type_id = TEXTOID,
 		},
+		[ContinuousViewOptionMaterializedOnly] = {
+			.arg_name = "materialized_only",
+			.type_id = BOOLOID,
+			.default_val = BoolGetDatum(false),
+		},
 };
 
 WithClauseResult *
@@ -492,14 +497,16 @@ drop_continuous_agg(ContinuousAgg *agg, bool drop_user_view)
 	 * wait on */
 	ts_bgw_job_delete_by_id(agg->data.job_id);
 
-	if (drop_user_view)
-	{
-		user_view = (ObjectAddress){
-			.classId = RelationRelationId,
-			.objectId = ts_continuous_agg_get_user_view_oid(agg),
-		};
+	user_view = (ObjectAddress){
+		.classId = RelationRelationId,
+		.objectId =
+			get_relname_relid(NameStr(agg->data.user_view_name),
+							  get_namespace_oid(NameStr(agg->data.user_view_schema), false)),
+	};
+	/* The partial view may already be dropped by PG's dependency system (e.g. the raw table was
+	 * dropped) */
+	if (OidIsValid(user_view.objectId))
 		LockRelationOid(user_view.objectId, AccessExclusiveLock);
-	}
 
 	raw_hypertable = ts_hypertable_get_by_id(agg->data.raw_hypertable_id);
 	/* The raw hypertable might be already dropped if this is a cascade from that drop */
@@ -516,7 +523,8 @@ drop_continuous_agg(ContinuousAgg *agg, bool drop_user_view)
 	/* lock catalogs */
 	LockRelationOid(catalog_get_table_id(catalog, BGW_JOB), RowExclusiveLock);
 	LockRelationOid(catalog_get_table_id(catalog, CONTINUOUS_AGG), RowExclusiveLock);
-	raw_hypertable_has_other_caggs = number_of_continuous_aggs_attached(raw_hypertable->fd.id) > 1;
+	raw_hypertable_has_other_caggs =
+		raw_hypertable_exists && number_of_continuous_aggs_attached(raw_hypertable->fd.id) > 1;
 	if (!raw_hypertable_has_other_caggs)
 		LockRelationOid(catalog_get_table_id(catalog, CONTINUOUS_AGGS_HYPERTABLE_INVALIDATION_LOG),
 						RowExclusiveLock);
@@ -847,7 +855,7 @@ find_raw_hypertable_for_materialization(int32 mat_hypertable_id)
  * we find a hypertable that has integer_now_func set.
  */
 TSDLLEXPORT Dimension *
-ts_continous_agg_find_integer_now_func_by_materialization_id(int32 mat_htid)
+ts_continuous_agg_find_integer_now_func_by_materialization_id(int32 mat_htid)
 {
 	int32 raw_htid = mat_htid;
 	Dimension *par_dim = NULL;

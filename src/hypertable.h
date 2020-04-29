@@ -88,7 +88,7 @@ extern int ts_hypertable_scan_with_memory_context(const char *schema, const char
 												  tuple_found_func tuple_found, void *data,
 												  LOCKMODE lockmode, bool tuplock,
 												  MemoryContext mctx);
-extern HTSU_Result ts_hypertable_lock_tuple(Oid table_relid);
+extern TM_Result ts_hypertable_lock_tuple(Oid table_relid);
 extern bool ts_hypertable_lock_tuple_simple(Oid table_relid);
 extern int ts_hypertable_update(Hypertable *ht);
 extern int ts_hypertable_set_name(Hypertable *ht, const char *newname);
@@ -110,7 +110,7 @@ extern Oid ts_hypertable_relid(RangeVar *rv);
 extern TSDLLEXPORT bool ts_is_hypertable(Oid relid);
 extern bool ts_hypertable_has_tablespace(Hypertable *ht, Oid tspc_oid);
 extern Tablespace *ts_hypertable_select_tablespace(Hypertable *ht, Chunk *chunk);
-extern char *ts_hypertable_select_tablespace_name(Hypertable *ht, Chunk *chunk);
+extern const char *ts_hypertable_select_tablespace_name(Hypertable *ht, Chunk *chunk);
 extern Tablespace *ts_hypertable_get_tablespace_at_offset_from(int32 hypertable_id,
 															   Oid tablespace_oid, int16 offset);
 extern bool ts_hypertable_has_tuples(Oid table_relid, LOCKMODE lockmode);

@@ -135,8 +135,8 @@ typedef enum MinMaxResult
 static MinMaxResult
 minmax_heapscan(Relation rel, Oid atttype, AttrNumber attnum, Datum minmax[2])
 {
-	HeapScanDesc scan;
-	HeapTuple tuple;
+	TupleTableSlot *slot = table_slot_create(rel, NULL);
+	TableScanDesc scan;
 	TypeCacheEntry *tce;
 	bool nulls[2] = { true, true };
 
@@ -146,12 +146,12 @@ minmax_heapscan(Relation rel, Oid atttype, AttrNumber attnum, Datum minmax[2])
 	if (NULL == tce || !OidIsValid(tce->cmp_proc))
 		elog(ERROR, "no comparison function for type %u", atttype);
 
-	scan = heap_beginscan(rel, GetTransactionSnapshot(), 0, NULL);
+	scan = table_beginscan(rel, GetTransactionSnapshot(), 0, NULL);
 
-	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 	{
 		bool isnull;
-		Datum value = heap_getattr(tuple, attnum, RelationGetDescr(rel), &isnull);
+		Datum value = slot_getattr(slot, attnum, &isnull);
 
 		if (isnull)
 			continue;
@@ -171,7 +171,8 @@ minmax_heapscan(Relation rel, Oid atttype, AttrNumber attnum, Datum minmax[2])
 		}
 	}
 
-	heap_endscan(scan);
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
 
 	return (nulls[0] || nulls[1]) ? MINMAX_NO_TUPLES : MINMAX_FOUND;
 }
@@ -183,31 +184,32 @@ static MinMaxResult
 minmax_indexscan(Relation rel, Relation idxrel, AttrNumber attnum, Datum minmax[2])
 {
 	IndexScanDesc scan = index_beginscan(rel, idxrel, GetTransactionSnapshot(), 0, 0);
-	HeapTuple tuple;
-	bool isnull;
+	TupleTableSlot *slot = table_slot_create(rel, NULL);
 	bool nulls[2] = { true, true };
-	int n = 0;
+	int i;
 
-	tuple = index_getnext(scan, BackwardScanDirection);
-
-	if (HeapTupleIsValid(tuple))
+	for (i = 0; i < 2; i++)
 	{
-		minmax[n] = heap_getattr(tuple, attnum, RelationGetDescr(rel), &isnull);
-		nulls[n++] = false;
-	}
+		static ScanDirection directions[2] = { BackwardScanDirection, ForwardScanDirection };
+		bool found_tuple;
+		bool isnull;
 
-	index_rescan(scan, NULL, 0, NULL, 0);
-	tuple = index_getnext(scan, ForwardScanDirection);
+		index_rescan(scan, NULL, 0, NULL, 0);
+		found_tuple = index_getnext_slot(scan, directions[i], slot);
 
-	if (HeapTupleIsValid(tuple))
-	{
-		minmax[n] = heap_getattr(tuple, attnum, RelationGetDescr(rel), &isnull);
-		nulls[n++] = false;
+		if (!found_tuple)
+			break;
+
+		minmax[i] = slot_getattr(slot, attnum, &isnull);
+		nulls[i] = isnull;
 	}
 
 	index_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
 
-	return (nulls[0] || nulls[1]) ? MINMAX_NO_TUPLES : MINMAX_FOUND;
+	Assert((nulls[0] && nulls[1]) || (!nulls[0] && !nulls[1]));
+
+	return nulls[0] ? MINMAX_NO_TUPLES : MINMAX_FOUND;
 }
 
 /*
@@ -250,10 +252,10 @@ static bool
 table_has_minmax_index(Oid relid, Oid atttype, Name attname, AttrNumber attnum)
 {
 	Datum minmax[2];
-	Relation rel = heap_open(relid, AccessShareLock);
+	Relation rel = table_open(relid, AccessShareLock);
 	MinMaxResult res = relation_minmax_indexscan(rel, atttype, attname, attnum, minmax);
 
-	heap_close(rel, AccessShareLock);
+	table_close(rel, AccessShareLock);
 
 	return res != MINMAX_NO_INDEX;
 }
@@ -266,7 +268,7 @@ table_has_minmax_index(Oid relid, Oid atttype, Name attname, AttrNumber attnum)
 static bool
 chunk_get_minmax(Oid relid, Oid atttype, AttrNumber attnum, Datum minmax[2])
 {
-	Relation rel = heap_open(relid, AccessShareLock);
+	Relation rel = table_open(relid, AccessShareLock);
 	NameData attname;
 	MinMaxResult res;
 
@@ -285,7 +287,7 @@ chunk_get_minmax(Oid relid, Oid atttype, AttrNumber attnum, Datum minmax[2])
 		res = minmax_heapscan(rel, atttype, attnum, minmax);
 	}
 
-	heap_close(rel, AccessShareLock);
+	table_close(rel, AccessShareLock);
 
 	return res == MINMAX_FOUND;
 }
@@ -758,7 +760,7 @@ ts_chunk_adaptive_set(PG_FUNCTION_ARGS)
 
 	ts_hypertable_permissions_check(info.table_relid, GetUserId());
 
-	ht = ts_hypertable_cache_get_cache_and_entry(info.table_relid, false, &hcache);
+	ht = ts_hypertable_cache_get_cache_and_entry(info.table_relid, CACHE_FLAG_NONE, &hcache);
 
 	/* Get the first open dimension that we will adapt on */
 	dim = ts_hyperspace_get_dimension(ht->space, DIMENSION_TYPE_OPEN, 0);

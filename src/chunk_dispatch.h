@@ -9,6 +9,7 @@
 #include <postgres.h>
 #include <nodes/parsenodes.h>
 #include <nodes/execnodes.h>
+#include <executor/tuptable.h>
 
 #include "hypertable_cache.h"
 #include "cache.h"
@@ -23,31 +24,35 @@
  */
 typedef struct ChunkDispatch
 {
+	/* Link to the executor state for INSERTs. This is not set for COPY path. */
+	const struct ChunkDispatchState *dispatch_state;
 	Hypertable *hypertable;
 	SubspaceStore *cache;
 	EState *estate;
-
 	/*
 	 * Keep a pointer to the original (hypertable's) ResultRelInfo since we
 	 * will reset the pointer in EState as we lookup new chunks.
 	 */
 	ResultRelInfo *hypertable_result_rel_info;
-	OnConflictAction on_conflict;
-	List *arbiter_indexes;
-	int returning_index;
-	List *returning_lists;
-	List *on_conflict_set;
-	List *on_conflict_where;
-	CmdType cmd_type;
 	ChunkInsertState *prev_cis;
 	Oid prev_cis_oid;
 } ChunkDispatch;
 
 typedef struct Point Point;
 
+typedef void (*on_chunk_changed_func)(ChunkInsertState *state, void *data);
+
 extern ChunkDispatch *ts_chunk_dispatch_create(Hypertable *ht, EState *estate);
-void ts_chunk_dispatch_destroy(ChunkDispatch *dispatch);
-extern ChunkInsertState *ts_chunk_dispatch_get_chunk_insert_state(ChunkDispatch *dispatch, Point *p,
-																  bool *cis_changed_out);
+extern void ts_chunk_dispatch_destroy(ChunkDispatch *dispatch);
+extern ChunkInsertState *
+ts_chunk_dispatch_get_chunk_insert_state(ChunkDispatch *dispatch, Point *p,
+										 const on_chunk_changed_func on_chunk_changed, void *data);
+extern bool ts_chunk_dispatch_has_returning(const ChunkDispatch *dispatch);
+extern List *ts_chunk_dispatch_get_returning_clauses(const ChunkDispatch *dispatch);
+extern List *ts_chunk_dispatch_get_arbiter_indexes(const ChunkDispatch *dispatch);
+extern OnConflictAction ts_chunk_dispatch_get_on_conflict_action(const ChunkDispatch *dispatch);
+extern List *ts_chunk_dispatch_get_on_conflict_set(const ChunkDispatch *dispatch);
+extern Node *ts_chunk_dispatch_get_on_conflict_where(const ChunkDispatch *dispatch);
+extern CmdType ts_chunk_dispatch_get_cmd_type(const ChunkDispatch *dispatch);
 
 #endif /* TIMESCALEDB_CHUNK_DISPATCH_H */

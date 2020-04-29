@@ -9,7 +9,6 @@
 #include <nodes/extensible.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
-#include <optimizer/clauses.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/paths.h>
 #include <optimizer/placeholder.h>
@@ -17,15 +16,22 @@
 #include <optimizer/prep.h>
 #include <optimizer/subselect.h>
 #include <optimizer/tlist.h>
-#include <optimizer/var.h>
 #include <parser/parsetree.h>
+
+#include "compat.h"
+#if PG12_LT
+#include <optimizer/clauses.h>
+#include <optimizer/var.h>
+#else
+#include <optimizer/appendinfo.h>
+#include <optimizer/optimizer.h>
+#endif
 
 #include "chunk_append/chunk_append.h"
 #include "chunk_append/planner.h"
 #include "chunk_append/exec.h"
 #include "chunk_append/transform.h"
-#include "planner_import.h"
-#include "compat.h"
+#include "import/planner.h"
 #include "guc.h"
 
 static Sort *make_sort(Plan *lefttree, int numCols, AttrNumber *sortColIdx, Oid *sortOperators,

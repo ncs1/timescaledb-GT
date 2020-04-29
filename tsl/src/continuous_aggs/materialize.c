@@ -1,4 +1,3 @@
-
 /*
  * This file and its contents are licensed under the Timescale License.
  * Please see the included NOTICE for copyright information and
@@ -202,8 +201,8 @@ continuous_agg_materialize(int32 materialization_id, ContinuousAggMatOptions *op
 	caggs = ts_continuous_aggs_find_by_raw_table_id(cagg_data.raw_hypertable_id);
 	drain_invalidation_log(cagg_data.raw_hypertable_id, &invalidations);
 	materialization_invalidation_log_table_relation =
-		heap_open(catalog_get_table_id(catalog, CONTINUOUS_AGGS_MATERIALIZATION_INVALIDATION_LOG),
-				  RowExclusiveLock);
+		table_open(catalog_get_table_id(catalog, CONTINUOUS_AGGS_MATERIALIZATION_INVALIDATION_LOG),
+				   RowExclusiveLock);
 	insert_materialization_invalidation_logs(caggs,
 											 invalidations,
 											 materialization_invalidation_log_table_relation);
@@ -273,7 +272,7 @@ continuous_agg_materialize(int32 materialization_id, ContinuousAggMatOptions *op
 								   materialization_invalidation_threshold);
 	}
 
-	relation_close(materialization_invalidation_log_table_relation, NoLock);
+	table_close(materialization_invalidation_log_table_relation, NoLock);
 
 	if (!options->within_single_transaction)
 	{
@@ -377,8 +376,9 @@ get_continuous_agg(int32 mat_hypertable_id)
 	return cagg;
 }
 
-static int64 hypertable_get_min(SchemaAndName hypertable, Name time_column, Oid time_type,
-								bool *found);
+static bool hypertable_get_min_and_max_time_value(SchemaAndName hypertable, Name time_column,
+												  int64 search_start, Oid time_type, int64 *min_out,
+												  int64 *max_out);
 
 static int64
 get_materialization_end_point_for_table(int32 raw_hypertable_id, int32 materialization_id,
@@ -396,16 +396,22 @@ get_materialization_end_point_for_table(int32 raw_hypertable_id, int32 materiali
 	NameData time_column_name = time_column->fd.column_name;
 	Oid time_column_type = ts_dimension_get_partition_type(time_column);
 	int64 now_time = ts_get_now_internal(time_column);
-	int64 end_time, start_time;
+	int64 end_time, start_time, min_time, max_time = PG_INT64_MAX;
+	bool found_new_tuples = false;
 
 	start_time = old_completed_threshold;
+
+	found_new_tuples = hypertable_get_min_and_max_time_value(hypertable,
+															 &time_column_name,
+															 old_completed_threshold,
+															 time_column_type,
+															 &min_time,
+															 &max_time);
 	if (start_time == PG_INT64_MIN)
 	{
-		/* If there is no completion threshold yet set, find the minimum value stored in the
+		/* If there is no completion threshold yet set, use the minimum value stored in the
 		 * hypertable */
-		bool found;
-		start_time = hypertable_get_min(hypertable, &time_column_name, time_column_type, &found);
-		if (!found)
+		if (!found_new_tuples)
 		{
 			if (verbose)
 				elog(LOG,
@@ -417,6 +423,7 @@ get_materialization_end_point_for_table(int32 raw_hypertable_id, int32 materiali
 			*materializing_new_range = false;
 			return old_completed_threshold;
 		}
+		start_time = min_time;
 	}
 
 	/* check for values which would overflow 64 bit subtractionb */
@@ -445,7 +452,8 @@ get_materialization_end_point_for_table(int32 raw_hypertable_id, int32 materiali
 
 	end_time = now_time - refresh_lag;
 	end_time = ts_time_bucket_by_type(bucket_width, end_time, time_column_type);
-	if (end_time <= start_time)
+
+	if (!found_new_tuples || (end_time <= start_time))
 	{
 		if (verbose)
 			elog(LOG,
@@ -459,7 +467,25 @@ get_materialization_end_point_for_table(int32 raw_hypertable_id, int32 materiali
 		*materializing_new_range = false;
 		return old_completed_threshold;
 	}
-
+	if (max_time < end_time)
+	{
+		/* end_time is based on now(). But we might not have any new data to materialize.
+		 * So limit the end_time to max value from the hypertable's data, adjusted
+		 * by time_bucket width parameter (which is a positive value)
+		 */
+		int64 maxtime_corrected = ts_time_bucket_by_type(bucket_width, max_time, time_column_type);
+		if (maxtime_corrected <= max_time)
+		{
+			/* we need to include max_time in our materialization range as we materialize upto the
+			 * end_time but not inclusive. i.e. [start_time , end_time)
+			 */
+			maxtime_corrected = int64_saturating_add(maxtime_corrected, bucket_width);
+		}
+		if (maxtime_corrected < end_time)
+		{
+			end_time = maxtime_corrected;
+		}
+	}
 	/* pin the end time to start_time + max_interval_per_job
 	 * so we don't materialize more than max_interval_per_job per run
 	 */
@@ -492,25 +518,78 @@ get_materialization_end_point_for_table(int32 raw_hypertable_id, int32 materiali
 	return end_time;
 }
 
-static int64
-hypertable_get_min(SchemaAndName hypertable, Name time_column, Oid time_type, bool *found)
+/* get min and max value for timestamp column for hypertable */
+static bool
+hypertable_get_min_and_max_time_value(SchemaAndName hypertable, Name time_column,
+									  int64 search_start, Oid time_type, int64 *min_out,
+									  int64 *max_out)
 {
-	Datum min_time_datum;
-	bool val_is_null;
+	Datum last_time_value;
+	Datum first_time_value;
+	bool fval_is_null, lval_is_null;
+	bool search_start_is_infinite = false;
+	bool found_new_tuples = false;
 	StringInfo command = makeStringInfo();
 	int res;
-	int64 min_time_internal = PG_INT64_MIN;
-	*found = false;
+
+	Datum search_start_val =
+		internal_to_time_value_or_infinite(search_start, time_type, &search_start_is_infinite);
+
+	Assert(max_out != NULL);
+	Assert(min_out != NULL);
+	Assert(time_column != NULL);
+
+	if (search_start_is_infinite && search_start > 0)
+	{
+		/* the previous completed time was +infinity, there can be no new ranges */
+		return false;
+	}
 
 	res = SPI_connect();
 	if (res != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI while search for new tuples");
 
-	appendStringInfo(command,
-					 "SELECT min(%s) FROM %s.%s",
-					 quote_identifier(NameStr(*time_column)),
-					 quote_identifier(NameStr(*hypertable.schema)),
-					 quote_identifier(NameStr(*hypertable.name)));
+	/* We always SELECT both max and min in the following queries. There are two cases
+	 * 1. there is no index on time: then we want to perform only one seqscan.
+	 * 2. there is a btree index on time: then postgres will transform the query
+	 *    into two index-only scans, which should add very little extra work
+	 *    compared to the materialization.
+	 * Ordered append append also fires, so we never scan beyond the first and last chunks
+	 */
+	if (search_start_is_infinite)
+	{
+		/* previous completed time is -infinity, or does not exist, so we must scan from the
+		 * beginning */
+		appendStringInfo(command,
+						 "SELECT max(%s), min(%s) FROM %s.%s",
+						 quote_identifier(NameStr(*time_column)),
+						 quote_identifier(NameStr(*time_column)),
+						 quote_identifier(NameStr(*hypertable.schema)),
+						 quote_identifier(NameStr(*hypertable.name)));
+	}
+	else
+	{
+		Oid out_fn;
+		bool type_is_varlena;
+		char *search_start_str;
+
+		getTypeOutputInfo(time_type, &out_fn, &type_is_varlena);
+
+		search_start_str = OidOutputFunctionCall(out_fn, search_start_val);
+
+		*min_out = search_start;
+		/* normal case, add a WHERE to take advantage of chunk constraints */
+		/*We handled the +infinity case above*/
+		Assert(!search_start_is_infinite);
+		appendStringInfo(command,
+						 "SELECT max(%s), min(%s) FROM %s.%s WHERE %s >= %s",
+						 quote_identifier(NameStr(*time_column)),
+						 quote_identifier(NameStr(*time_column)),
+						 quote_identifier(NameStr(*hypertable.schema)),
+						 quote_identifier(NameStr(*hypertable.name)),
+						 quote_identifier(NameStr(*time_column)),
+						 quote_literal_cstr(search_start_str));
+	}
 
 	res = SPI_execute_with_args(command->data,
 								0 /*=nargs*/,
@@ -520,25 +599,31 @@ hypertable_get_min(SchemaAndName hypertable, Name time_column, Oid time_type, bo
 								true /*=read_only*/,
 								0 /*count*/);
 	if (res < 0)
-		elog(ERROR, "could not find the minimum time value for a hypertable");
+		elog(ERROR, "could not find the minimum/maximum time value for hypertable");
 
 	Assert(SPI_gettypeid(SPI_tuptable->tupdesc, 1) == time_type);
+	Assert(SPI_gettypeid(SPI_tuptable->tupdesc, 2) == time_type);
 
-	if (SPI_processed == 1)
+	first_time_value =
+		SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &fval_is_null);
+	last_time_value = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &lval_is_null);
+	Assert(fval_is_null == lval_is_null);
+
+	if (lval_is_null)
 	{
-		min_time_datum =
-			SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &val_is_null);
-
-		/* min on an empty table returns a NULL so only process not-nulls */
-		if (!val_is_null)
-		{
-			min_time_internal = ts_time_value_to_internal(min_time_datum, time_type);
-			*found = true;
-		}
+		*min_out = PG_INT64_MIN;
+		*max_out = PG_INT64_MAX;
 	}
+	else
+	{
+		*min_out = ts_time_value_to_internal(first_time_value, time_type);
+		*max_out = ts_time_value_to_internal(last_time_value, time_type);
+		found_new_tuples = true;
+	}
+
 	res = SPI_finish();
 	Assert(res == SPI_OK_FINISH);
-	return min_time_internal;
+	return found_new_tuples;
 }
 
 /* materialization_invalidation_threshold is used only for materialization_invalidation_log
@@ -811,6 +896,7 @@ insert_materialization_invalidation_logs(List *caggs, List *invalidations,
 		foreach (lc2, invalidations)
 		{
 			Invalidation *entry = (Invalidation *) lfirst(lc2);
+			int64 lowest_modified_value = entry->lowest_modified_value;
 			int64 minimum_invalidation_time =
 				ts_continuous_aggs_get_minimum_invalidation_time(entry->modification_time,
 																 ignore_invalidation_older_than);
@@ -818,7 +904,7 @@ insert_materialization_invalidation_logs(List *caggs, List *invalidations,
 				continue;
 
 			if (entry->lowest_modified_value < minimum_invalidation_time)
-				entry->lowest_modified_value = minimum_invalidation_time;
+				lowest_modified_value = minimum_invalidation_time;
 
 			values[AttrNumberGetAttrOffset(
 				Anum_continuous_aggs_materialization_invalidation_log_materialization_id)] =
@@ -828,7 +914,7 @@ insert_materialization_invalidation_logs(List *caggs, List *invalidations,
 				Int64GetDatum(entry->modification_time);
 			values[AttrNumberGetAttrOffset(
 				Anum_continuous_aggs_materialization_invalidation_log_lowest_modified_value)] =
-				Int64GetDatum(entry->lowest_modified_value);
+				Int64GetDatum(lowest_modified_value);
 			values[AttrNumberGetAttrOffset(
 				Anum_continuous_aggs_materialization_invalidation_log_greatest_modified_value)] =
 				Int64GetDatum(entry->greatest_modified_value);
@@ -1032,8 +1118,8 @@ invalidation_threshold_set(int32 raw_hypertable_id, int64 invalidation_threshold
 		 * above for the rationale
 		 */
 		Relation rel =
-			heap_open(catalog_get_table_id(catalog, CONTINUOUS_AGGS_INVALIDATION_THRESHOLD),
-					  AccessExclusiveLock);
+			table_open(catalog_get_table_id(catalog, CONTINUOUS_AGGS_INVALIDATION_THRESHOLD),
+					   AccessExclusiveLock);
 		TupleDesc desc = RelationGetDescr(rel);
 		Datum values[Natts_continuous_aggs_invalidation_threshold];
 		bool nulls[Natts_continuous_aggs_invalidation_threshold] = { false };
@@ -1044,7 +1130,7 @@ invalidation_threshold_set(int32 raw_hypertable_id, int64 invalidation_threshold
 			Int64GetDatum(invalidation_threshold);
 
 		ts_catalog_insert_values(rel, desc, values, nulls);
-		relation_close(rel, NoLock);
+		table_close(rel, NoLock);
 	}
 }
 
@@ -1447,8 +1533,9 @@ continuous_aggs_completed_threshold_set(int32 materialization_id, int64 complete
 	if (!updated_threshold)
 	{
 		Catalog *catalog = ts_catalog_get();
-		Relation rel = heap_open(catalog_get_table_id(catalog, CONTINUOUS_AGGS_COMPLETED_THRESHOLD),
-								 RowExclusiveLock);
+		Relation rel =
+			table_open(catalog_get_table_id(catalog, CONTINUOUS_AGGS_COMPLETED_THRESHOLD),
+					   RowExclusiveLock);
 		TupleDesc desc = RelationGetDescr(rel);
 		Datum values[Natts_continuous_aggs_completed_threshold];
 		bool nulls[Natts_continuous_aggs_completed_threshold] = { false };
@@ -1460,6 +1547,6 @@ continuous_aggs_completed_threshold_set(int32 materialization_id, int64 complete
 			Int64GetDatum(completed_threshold);
 
 		ts_catalog_insert_values(rel, desc, values, nulls);
-		relation_close(rel, NoLock);
+		table_close(rel, NoLock);
 	}
 }

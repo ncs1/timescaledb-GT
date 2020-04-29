@@ -7,15 +7,19 @@
 #include <miscadmin.h>
 #include <pgstat.h>
 #include <access/xact.h>
+#include <catalog/pg_authid.h>
 #include <postmaster/bgworker.h>
 #include <storage/ipc.h>
 #include <tcop/tcopprot.h>
 #include <utils/builtins.h>
 #include <utils/memutils.h>
+#include <utils/syscache.h>
 #include <utils/timestamp.h>
+#include <storage/lock.h>
 #include <storage/proc.h>
 #include <storage/procarray.h>
 #include <storage/sinvaladt.h>
+#include <utils/elog.h>
 
 #include "job.h"
 #include "scanner.h"
@@ -34,6 +38,25 @@
 #include <cross_module_fn.h>
 
 #define TELEMETRY_INITIAL_NUM_RUNS 12
+
+#if PG12_LT
+static VirtualTransactionId *
+GetLockConflictsCompat(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
+{
+	VirtualTransactionId *ids = GetLockConflicts(locktag, lockmode);
+	if (countp != NULL)
+	{
+		for (*countp = 0; VirtualTransactionIdIsValid(ids[*countp]); (*countp)++)
+		{
+			/* Counts the number of virtual transactions ids into countp */
+		}
+	}
+	return ids;
+}
+#else
+#define GetLockConflictsCompat(locktag, lockmode, countp)                                          \
+	GetLockConflicts(locktag, lockmode, countp)
+#endif
 
 static const char *job_type_names[_MAX_JOB_TYPE] = {
 	[JOB_TYPE_VERSION_CHECK] = "telemetry_and_version_check_if_enabled",
@@ -127,6 +150,7 @@ ts_bgw_job_owner(BgwJob *job)
 			break;
 	}
 	elog(ERROR, "unknown job type \"%s\" in finding owner", NameStr(job->fd.job_type));
+	pg_unreachable();
 }
 
 BackgroundWorkerHandle *
@@ -255,7 +279,7 @@ lock_job(int32 job_id, LOCKMODE mode, JobLockLifetime lock_type, LOCKTAG *tag, b
 
 static BgwJob *
 ts_bgw_job_find_with_lock(int32 bgw_job_id, MemoryContext mctx, LOCKMODE tuple_lock_mode,
-						  JobLockLifetime lock_type, bool block)
+						  JobLockLifetime lock_type, bool block, bool *got_lock)
 {
 	/* Take a share lock on the table to prevent concurrent data changes during scan. This lock will
 	 * be released after the scan */
@@ -265,7 +289,7 @@ ts_bgw_job_find_with_lock(int32 bgw_job_id, MemoryContext mctx, LOCKMODE tuple_l
 	LOCKTAG tag;
 
 	/* take advisory lock before relation lock */
-	if (!lock_job(bgw_job_id, tuple_lock_mode, lock_type, &tag, block))
+	if (!(*got_lock = lock_job(bgw_job_id, tuple_lock_mode, lock_type, &tag, block)))
 	{
 		/* return NULL if lock could not be acquired */
 		Assert(!block);
@@ -289,15 +313,31 @@ ts_bgw_job_find_with_lock(int32 bgw_job_id, MemoryContext mctx, LOCKMODE tuple_l
 /* Take a lock on the job for the duration of the txn. This prevents
  *  the job from being deleted.
  *
- *  Returns whether or not the job still exists.
+ *  Returns true if the job is found ( we block till we can acquire a lock
+ *                               so we will always lock here)
+ *          false if the job is missing.
  */
 bool
 ts_bgw_job_get_share_lock(int32 bgw_job_id, MemoryContext mctx)
 {
+	bool got_lock;
 	/* note the mode here is equivalent to FOR SHARE row locks */
-	BgwJob *job = ts_bgw_job_find_with_lock(bgw_job_id, mctx, RowShareLock, TXN_LOCK, true);
+	BgwJob *job = ts_bgw_job_find_with_lock(bgw_job_id,
+											mctx,
+											RowShareLock,
+											TXN_LOCK,
+											true /* block */
+											,
+											&got_lock);
 	if (job != NULL)
 	{
+		if (!got_lock)
+		{
+			/* since we blocked for a lock , this is an unexpected condition */
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not acquire share lock for job=%d", bgw_job_id)));
+		}
 		pfree(job);
 		return true;
 	}
@@ -344,7 +384,7 @@ get_job_lock_for_delete(int32 job_id)
 	{
 		/* If I couldn't get a lock, try killing the background worker that's running the job.
 		 * This is probably not bulletproof but best-effort is good enough here. */
-		VirtualTransactionId *vxid = GetLockConflicts(&tag, AccessExclusiveLock);
+		VirtualTransactionId *vxid = GetLockConflictsCompat(&tag, AccessExclusiveLock, NULL);
 		PGPROC *proc;
 
 		if (VirtualTransactionIdIsValid(*vxid))
@@ -449,8 +489,28 @@ ts_bgw_job_permission_check(BgwJob *job)
 	if (!has_privs_of_role(GetUserId(), owner_oid))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("insufficient permssions to alter job %d", job->fd.id)));
+				 errmsg("insufficient permissions to alter job %d", job->fd.id)));
 }
+
+void
+ts_bgw_job_validate_job_owner(Oid owner, JobType type)
+{
+	HeapTuple role_tup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(owner));
+	Form_pg_authid rform = (Form_pg_authid) GETSTRUCT(role_tup);
+
+	if (!rform->rolcanlogin)
+	{
+		ReleaseSysCache(role_tup);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+				 errmsg("permission denied to start %s background process as role \"%s\"",
+						job_type_names[type],
+						rform->rolname.data),
+				 errhint("Hypertable owner must have LOGIN permission to run background tasks.")));
+	}
+	ReleaseSysCache(role_tup);
+}
+
 bool
 ts_bgw_job_execute(BgwJob *job)
 {
@@ -557,6 +617,7 @@ ts_bgw_job_entrypoint(PG_FUNCTION_ARGS)
 	int32 job_id;
 	BgwJob *job;
 	JobResult res = JOB_FAILURE;
+	bool got_lock;
 
 	if (sscanf(MyBgworkerEntry->bgw_extra, "%u %d", &user_uid, &job_id) != 2)
 		elog(ERROR, "job entrypoint got invalid bgw_extra");
@@ -584,7 +645,8 @@ ts_bgw_job_entrypoint(PG_FUNCTION_ARGS)
 									TopMemoryContext,
 									RowShareLock,
 									SESSION_LOCK,
-									/* block */ true);
+									/* block */ true,
+									&got_lock);
 	CommitTransactionCommand();
 
 	if (job == NULL)
@@ -640,7 +702,8 @@ ts_bgw_job_entrypoint(PG_FUNCTION_ARGS)
 										TopMemoryContext,
 										RowShareLock,
 										TXN_LOCK,
-										/* block */ false);
+										/* block */ false,
+										&got_lock);
 		if (job != NULL)
 		{
 			ts_bgw_job_stat_mark_end(job, JOB_FAILURE);
@@ -653,7 +716,7 @@ ts_bgw_job_entrypoint(PG_FUNCTION_ARGS)
 		 * the rethrow will log the error; but also log which job threw the
 		 * error
 		 */
-		elog(DEBUG1, "job %d threw an error", job_id);
+		elog(LOG, "job %d threw an error", job_id);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -739,7 +802,7 @@ ts_bgw_job_insert_relation(Name application_name, Name job_type, Interval *sched
 	CatalogSecurityContext sec_ctx;
 	bool nulls[Natts_bgw_job] = { false };
 
-	rel = heap_open(catalog_get_table_id(catalog, BGW_JOB), RowExclusiveLock);
+	rel = table_open(catalog_get_table_id(catalog, BGW_JOB), RowExclusiveLock);
 	desc = RelationGetDescr(rel);
 
 	values[AttrNumberGetAttrOffset(Anum_bgw_job_application_name)] = NameGetDatum(application_name);
@@ -756,7 +819,7 @@ ts_bgw_job_insert_relation(Name application_name, Name job_type, Interval *sched
 	ts_catalog_insert_values(rel, desc, values, nulls);
 	ts_catalog_restore_user(&sec_ctx);
 
-	heap_close(rel, RowExclusiveLock);
+	table_close(rel, RowExclusiveLock);
 	return values[AttrNumberGetAttrOffset(Anum_bgw_job_id)];
 }
 

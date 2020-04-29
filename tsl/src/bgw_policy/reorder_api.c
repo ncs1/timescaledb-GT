@@ -6,6 +6,7 @@
 
 #include <postgres.h>
 #include <catalog/namespace.h>
+#include <catalog/pg_collation.h>
 #include <catalog/pg_type.h>
 #include <utils/builtins.h>
 #include <utils/timestamp.h>
@@ -15,6 +16,8 @@
 
 #include <dimension.h>
 
+#include "compat.h"
+
 #include "bgw/job.h"
 #include "bgw_policy/reorder.h"
 #include "errors.h"
@@ -22,9 +25,6 @@
 #include "license.h"
 #include "reorder_api.h"
 #include "utils.h"
-#include "hypertable.h"
-#include "bgw/job.h"
-#include <bgw_policy/reorder.h>
 
 /*
  * Default scheduled interval for reorder jobs should be 1/2 of the default chunk length.
@@ -82,13 +82,14 @@ reorder_add_policy(PG_FUNCTION_ARGS)
 	int32 hypertable_id = ts_hypertable_relid_to_id(ht_oid);
 	Hypertable *ht = ts_hypertable_get_by_id(hypertable_id);
 	Oid partitioning_type;
+	Oid owner_id;
 
 	BgwPolicyReorder policy = { .fd = {
 									.hypertable_id = hypertable_id,
 									.hypertable_index_name = *index_name,
 								} };
 
-	ts_hypertable_permissions_check(ht_oid, GetUserId());
+	owner_id = ts_hypertable_permissions_check(ht_oid, GetUserId());
 
 	/* First verify that the hypertable corresponds to a valid table */
 	if (!ts_is_hypertable(ht_oid))
@@ -99,6 +100,9 @@ reorder_add_policy(PG_FUNCTION_ARGS)
 
 	/* Now verify that the index is an actual index on that hypertable */
 	check_valid_index(ht, index_name);
+
+	/* Verify that the hypertable owner can create a background worker */
+	ts_bgw_job_validate_job_owner(owner_id, JOB_TYPE_REORDER);
 
 	/* Make sure that an existing policy doesn't exist on this hypertable */
 	existing = ts_bgw_policy_reorder_find_by_hypertable(ts_hypertable_relid_to_id(ht_oid));
@@ -111,9 +115,10 @@ reorder_add_policy(PG_FUNCTION_ARGS)
 					 errmsg("reorder policy already exists for hypertable \"%s\"",
 							get_rel_name(ht_oid))));
 
-		if (!DatumGetBool(DirectFunctionCall2(nameeq,
-											  NameGetDatum(&existing->fd.hypertable_index_name),
-											  NameGetDatum(index_name))))
+		if (!DatumGetBool(DirectFunctionCall2Coll(nameeq,
+												  C_COLLATION_OID,
+												  NameGetDatum(&existing->fd.hypertable_index_name),
+												  NameGetDatum(index_name))))
 		{
 			elog(WARNING,
 				 "could not add reorder policy due to existing policy on hypertable with different "

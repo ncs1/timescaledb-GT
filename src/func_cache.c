@@ -6,8 +6,6 @@
 #include <postgres.h>
 #include <miscadmin.h>
 #include <parser/parse_oper.h>
-#include <optimizer/cost.h>
-#include <optimizer/clauses.h>
 #include <catalog/namespace.h>
 #include <catalog/pg_type.h>
 #include <catalog/pg_proc.h>
@@ -19,6 +17,16 @@
 #include <utils/selfuncs.h>
 #include <utils/builtins.h>
 #include <utils/rel.h>
+
+#include "compat.h"
+#if PG12_LT
+#include <nodes/relation.h>
+#include <optimizer/cost.h>
+#include <optimizer/clauses.h>
+#else
+#include <nodes/pathnodes.h>
+#include <optimizer/optimizer.h>
+#endif
 
 #include "utils.h"
 #include "cache.h"
@@ -290,6 +298,17 @@ static FuncInfo funcinfo[] = {
 
 static HTAB *func_hash = NULL;
 
+static Oid
+proc_get_oid(HeapTuple tuple)
+{
+#if PG12_LT
+	return HeapTupleGetOid(tuple);
+#else
+	Form_pg_proc form = (Form_pg_proc) GETSTRUCT(tuple);
+	return form->oid;
+#endif
+}
+
 static void
 initialize_func_info()
 {
@@ -306,7 +325,7 @@ initialize_func_info()
 
 	func_hash = hash_create("func_cache", _MAX_CACHE_FUNCTIONS, &hashctl, HASH_ELEM | HASH_BLOBS);
 
-	rel = heap_open(ProcedureRelationId, AccessShareLock);
+	rel = table_open(ProcedureRelationId, AccessShareLock);
 
 	for (i = 0; i < _MAX_CACHE_FUNCTIONS; i++)
 	{
@@ -328,7 +347,7 @@ initialize_func_info()
 				 finfo->funcname,
 				 finfo->nargs);
 
-		funcid = HeapTupleGetOid(tuple);
+		funcid = proc_get_oid(tuple);
 
 		fentry = hash_search(func_hash, &funcid, HASH_ENTER, &hash_found);
 		Assert(!hash_found);
@@ -337,7 +356,7 @@ initialize_func_info()
 		ReleaseSysCache(tuple);
 	}
 
-	heap_close(rel, AccessShareLock);
+	table_close(rel, AccessShareLock);
 }
 
 FuncInfo *

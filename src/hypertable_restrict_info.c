@@ -5,10 +5,16 @@
  */
 #include <postgres.h>
 #include <utils/typcache.h>
-#include <optimizer/clauses.h>
 #include <utils/lsyscache.h>
 #include <parser/parsetree.h>
 #include <utils/array.h>
+
+#include "compat.h"
+#if PG12_LT
+#include <optimizer/clauses.h>
+#else
+#include <optimizer/optimizer.h>
+#endif
 
 #include "hypertable_restrict_info.h"
 #include "dimension.h"
@@ -86,7 +92,7 @@ dimension_restrict_info_create(Dimension *d)
 
 static bool
 dimension_restrict_info_open_add(DimensionRestrictInfoOpen *dri, StrategyNumber strategy,
-								 DimensionValues *dimvalues)
+								 Oid collation, DimensionValues *dimvalues)
 {
 	ListCell *item;
 	bool restriction_added = false;
@@ -99,6 +105,7 @@ dimension_restrict_info_open_add(DimensionRestrictInfoOpen *dri, StrategyNumber 
 	{
 		Oid restype;
 		Datum datum = ts_dimension_transform_value(dri->base.dimension,
+												   collation,
 												   PointerGetDatum(lfirst(item)),
 												   dimvalues->type,
 												   &restype);
@@ -140,7 +147,8 @@ dimension_restrict_info_open_add(DimensionRestrictInfoOpen *dri, StrategyNumber 
 }
 
 static List *
-dimension_restrict_info_get_partitions(DimensionRestrictInfoClosed *dri, List *values)
+dimension_restrict_info_get_partitions(DimensionRestrictInfoClosed *dri, Oid collation,
+									   List *values)
 {
 	List *partitions = NIL;
 	ListCell *item;
@@ -148,6 +156,7 @@ dimension_restrict_info_get_partitions(DimensionRestrictInfoClosed *dri, List *v
 	foreach (item, values)
 	{
 		Datum value = ts_dimension_transform_value(dri->base.dimension,
+												   collation,
 												   PointerGetDatum(lfirst(item)),
 												   InvalidOid,
 												   NULL);
@@ -160,7 +169,7 @@ dimension_restrict_info_get_partitions(DimensionRestrictInfoClosed *dri, List *v
 
 static bool
 dimension_restrict_info_closed_add(DimensionRestrictInfoClosed *dri, StrategyNumber strategy,
-								   DimensionValues *dimvalues)
+								   Oid collation, DimensionValues *dimvalues)
 {
 	List *partitions;
 	bool restriction_added = false;
@@ -170,7 +179,7 @@ dimension_restrict_info_closed_add(DimensionRestrictInfoClosed *dri, StrategyNum
 		return false;
 	}
 
-	partitions = dimension_restrict_info_get_partitions(dri, dimvalues->values);
+	partitions = dimension_restrict_info_get_partitions(dri, collation, dimvalues->values);
 
 	/* the intersection is empty when using ALL operator (ANDing values)  */
 	if (list_length(partitions) > 1 && !dimvalues->use_or)
@@ -205,17 +214,20 @@ dimension_restrict_info_closed_add(DimensionRestrictInfoClosed *dri, StrategyNum
 }
 
 static bool
-dimension_restrict_info_add(DimensionRestrictInfo *dri, int strategy, DimensionValues *values)
+dimension_restrict_info_add(DimensionRestrictInfo *dri, int strategy, Oid collation,
+							DimensionValues *values)
 {
 	switch (dri->dimension->type)
 	{
 		case DIMENSION_TYPE_OPEN:
 			return dimension_restrict_info_open_add((DimensionRestrictInfoOpen *) dri,
 													strategy,
+													collation,
 													values);
 		case DIMENSION_TYPE_CLOSED:
 			return dimension_restrict_info_closed_add((DimensionRestrictInfoClosed *) dri,
 													  strategy,
+													  collation,
 													  values);
 		default:
 			elog(ERROR, "unknown dimension type: %d", dri->dimension->type);
@@ -393,7 +405,7 @@ hypertable_restrict_info_add_expr(HypertableRestrictInfo *hri, PlannerInfo *root
 	get_op_opfamily_properties(op_oid, tce->btree_opf, false, &strategy, &lefttype, &righttype);
 
 	dimvalues = func_get_dim_values(c, use_or);
-	return dimension_restrict_info_add(dri, strategy, dimvalues);
+	return dimension_restrict_info_add(dri, strategy, c->constcollid, dimvalues);
 }
 
 static DimensionValues *

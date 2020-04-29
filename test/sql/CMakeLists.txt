@@ -1,6 +1,5 @@
 set(TEST_FILES
   alter.sql
-  chunk_adaptive.sql
   chunk_utils.sql
   chunks.sql
   cluster.sql
@@ -12,8 +11,6 @@ set(TEST_FILES
   cursor.sql
   ddl_alter_column.sql
   ddl_errors.sql
-  ddl_single.sql
-  ddl.sql
   delete.sql
   drop_schema.sql
   drop_owned.sql
@@ -27,13 +24,10 @@ set(TEST_FILES
   histogram_test.sql
   index.sql
   insert_single.sql
-  insert.sql
   lateral.sql
-  partitioning.sql
   pg_dump.sql
   pg_dump_unprivileged.sql
   plain.sql
-  query.sql
   reindex.sql
   relocate_extension.sql
   reloptions.sql
@@ -60,6 +54,7 @@ if(NOT APACHE_ONLY)
 if (${PG_VERSION_MAJOR} GREATER "9")
   list(APPEND TEST_FILES
     telemetry_compression.sql
+    chunk_utils_compression.sql
   )
 endif ()
 endif()
@@ -72,16 +67,11 @@ set(SOLO_TESTS
   alternate_users-9.6
   alternate_users-10
   alternate_users-11
+  alternate_users-12
   net
   pg_dump_unprivileged
   telemetry
 )
-
-# only test custom type if we are in 64-bit architecture
-if("${CMAKE_SIZEOF_VOID_P}" STREQUAL "8")
-  list(APPEND TEST_FILES
-    custom_type.sql)
-endif()
 
 if (CMAKE_BUILD_TYPE MATCHES Debug)
   list(APPEND TEST_FILES
@@ -90,7 +80,6 @@ if (CMAKE_BUILD_TYPE MATCHES Debug)
     c_unit_tests.sql
     loader.sql
     metadata.sql
-    multi_transaction_index.sql
     net.sql
     symbol_conflict.sql
     telemetry.sql)
@@ -117,14 +106,29 @@ endif()
 if(${PG_VERSION_MAJOR} EQUAL "11")
   list(APPEND TEST_FILES
     rowsecurity-11.sql
+  )
+endif()
+if(${PG_VERSION_MAJOR} EQUAL "12")
+  list(APPEND TEST_FILES
+    rowsecurity-12.sql
+  )
+endif()
+
+if ((${PG_VERSION_MAJOR} EQUAL "11") OR
+    (${PG_VERSION_MAJOR} GREATER "11"))
+  list(APPEND TEST_FILES
+    join.sql
+    partitionwise.sql
     vacuum_multi.sql
   )
 endif()
 
-if (${PG_VERSION_MAJOR} EQUAL "11" OR ${PG_VERSION_MAJOR} GREATER "11")
+if ((${PG_VERSION_MAJOR} EQUAL "12") OR
+    (${PG_VERSION_MAJOR} GREATER "12"))
   list(APPEND TEST_FILES
-    join.sql
-    partitionwise.sql
+    generated_columns.sql
+    misc.sql
+    tableam.sql
   )
 endif()
 
@@ -132,18 +136,36 @@ set(TEST_TEMPLATES
   agg_bookends.sql.in
   append.sql.in
   alternate_users.sql.in
+  ddl.sql.in
+  ddl_single.sql.in
+  insert.sql.in
+  chunk_adaptive.sql.in
   insert_many.sql.in
   parallel.sql.in
+  partition.sql.in
   partitioning.sql.in
   plan_expand_hypertable.sql.in
   #hashagg is different in 9.6 and 10 because of hashagg parallelism
   plan_hashagg.sql.in
   # lateral plans are different across versions, explains run without analyze on 9.6
   plan_ordered_append.sql.in
+  query.sql.in
   # Query tests differ in how PostgreSQL deals with projections on partitioned tables.
   sort_optimization.sql.in
   sql_query.sql.in
   )
+
+if (CMAKE_BUILD_TYPE MATCHES Debug)
+  list(APPEND TEST_TEMPLATES
+    multi_transaction_index.sql.in
+  )
+endif()
+
+# only test custom type if we are in 64-bit architecture
+if("${CMAKE_SIZEOF_VOID_P}" STREQUAL "8")
+  list(APPEND TEST_TEMPLATES
+    custom_type.sql.in)
+endif()
 
 # Regression tests that vary with PostgreSQL version. Generated test
 # files are put in the original source directory since all tests must

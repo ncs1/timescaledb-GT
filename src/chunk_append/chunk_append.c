@@ -5,18 +5,22 @@
  */
 #include <postgres.h>
 #include <nodes/nodeFuncs.h>
-#include <optimizer/clauses.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/paths.h>
 #include <optimizer/tlist.h>
-#include <optimizer/var.h>
 #include <utils/builtins.h>
 #include <utils/typcache.h>
 
-#include "hypertable.h"
+#include "compat.h"
+#if PG12_LT
+#include <optimizer/clauses.h>
+#include <optimizer/var.h>
+#else
+#include <optimizer/optimizer.h>
+#endif
+
 #include "chunk_append/chunk_append.h"
 #include "chunk_append/planner.h"
-#include "compat.h"
 #include "func_cache.h"
 #include "guc.h"
 
@@ -198,36 +202,41 @@ ts_chunk_append_path_create(PlannerInfo *root, RelOptInfo *rel, Hypertable *ht, 
 
 			foreach (lc_oid, current_oids)
 			{
-				Assert(lfirst_oid(lc_oid) ==
-					   root->simple_rte_array[((Path *) lfirst(flat))->parent->relid]->relid);
-				merge_childs = lappend(merge_childs, lfirst(flat));
-				flat = lnext(flat);
+				/* postgres may have pruned away some children already */
+				Path *child = (Path *) lfirst(flat);
+				Oid parent_relid = child->parent->relid;
+				bool is_not_pruned =
+					lfirst_oid(lc_oid) == root->simple_rte_array[parent_relid]->relid;
+#if PG12_LT
+				Assert(is_not_pruned);
+#endif
+				if (is_not_pruned)
+				{
+					merge_childs = lappend(merge_childs, child);
+					flat = lnext(flat);
+				}
 			}
 
 			if (list_length(merge_childs) > 1)
 			{
-#if PG96
-				append = create_merge_append_path(root,
-												  rel,
-												  merge_childs,
-												  path->cpath.path.pathkeys,
-												  PATH_REQ_OUTER(subpath));
-#else
-				append = create_merge_append_path(root,
-												  rel,
-												  merge_childs,
-												  path->cpath.path.pathkeys,
-												  PATH_REQ_OUTER(subpath),
-												  NIL);
-#endif
+				append = create_merge_append_path_compat(root,
+														 rel,
+														 merge_childs,
+														 path->cpath.path.pathkeys,
+														 PATH_REQ_OUTER(subpath));
 				nested_children = lappend(nested_children, append);
 			}
-			else
+			else if (list_length(merge_childs) == 1)
 			{
 				has_scan_childs = true;
 				nested_children = lappend(nested_children, linitial(merge_childs));
 			}
+#if PG12_LT
+			Assert(list_length(merge_childs) > 0);
+#endif
 		}
+
+		Assert(flat == NULL);
 
 		/*
 		 * if we do not have scans as direct childs of this

@@ -172,8 +172,10 @@ where table_name like 'foo' or table_name like 'conditions'
 order by table_name;
 \x
 
-select decompress_chunk(ch1.schema_name|| '.' || ch1.table_name)
-FROM _timescaledb_catalog.chunk ch1, _timescaledb_catalog.hypertable ht where ch1.hypertable_id = ht.id and ht.table_name like 'conditions';
+SELECT decompress_chunk(ch1.schema_name|| '.' || ch1.table_name) AS chunk
+FROM _timescaledb_catalog.chunk ch1, _timescaledb_catalog.hypertable ht
+WHERE ch1.hypertable_id = ht.id and ht.table_name LIKE 'conditions'
+ORDER BY chunk;
 
 SELECT count(*), count(*) = :'ORIGINAL_CHUNK_COUNT' from :CHUNK_NAME;
 --check that the compressed chunk is dropped
@@ -296,3 +298,137 @@ FROM _timescaledb_catalog.hypertable ht
 WHERE ht.table_name='datatype_test'
 ORDER BY attname;
 
+--try to compress a hypertable that has a continuous aggregate
+CREATE TABLE metrics(time timestamptz, device_id int, v1 float, v2 float);
+SELECT create_hypertable('metrics','time');
+
+INSERT INTO metrics SELECT generate_series('2000-01-01'::timestamptz,'2000-01-10','1m'),1,0.25,0.75;
+
+-- check expressions in view definition
+CREATE VIEW cagg_expr WITH (timescaledb.continuous)
+AS
+SELECT
+  time_bucket('1d', time) AS time,
+  'Const'::text AS Const,
+  4.3::numeric AS "numeric",
+  first(metrics,time),
+  CASE WHEN true THEN 'foo' ELSE 'bar' END,
+  COALESCE(NULL,'coalesce'),
+  avg(v1) + avg(v2) AS avg1,
+  avg(v1+v2) AS avg2
+FROM metrics
+GROUP BY 1;
+
+SET timescaledb.current_timestamp_mock = '2000-01-10';
+REFRESH MATERIALIZED VIEW cagg_expr;
+SELECT * FROM cagg_expr ORDER BY time LIMIT 5;
+
+ALTER TABLE metrics set(timescaledb.compress);
+
+-- test rescan in compress chunk dml blocker
+CREATE TABLE rescan_test(id integer NOT NULL, t timestamptz NOT NULL, val double precision, PRIMARY KEY(id, t));
+SELECT create_hypertable('rescan_test', 't', chunk_time_interval => interval '1 day');
+
+-- compression
+ALTER TABLE rescan_test SET (timescaledb.compress, timescaledb.compress_segmentby = 'id');
+
+-- INSERT dummy data
+INSERT INTO rescan_test SELECT 1, time, random() FROM generate_series('2000-01-01'::timestamptz, '2000-01-05'::timestamptz, '1h'::interval) g(time);
+
+
+SELECT count(*) FROM rescan_test;
+
+-- compress first chunk
+SELECT compress_chunk(ch1.schema_name|| '.' || ch1.table_name)
+FROM _timescaledb_catalog.chunk ch1, _timescaledb_catalog.hypertable ht where ch1.hypertable_id = ht.id
+and ht.table_name like 'rescan_test' ORDER BY ch1.id LIMIT 1;
+
+-- count should be equal to count before compression
+SELECT count(*) FROM rescan_test;
+
+-- single row update is fine
+UPDATE rescan_test SET val = val + 1 WHERE rescan_test.id = 1 AND rescan_test.t = '2000-01-03 00:00:00+00';
+
+-- multi row update via WHERE is fine
+UPDATE rescan_test SET val = val + 1 WHERE rescan_test.id = 1 AND rescan_test.t > '2000-01-03 00:00:00+00';
+
+-- single row update with FROM is allowed if no compressed chunks are hit
+UPDATE rescan_test SET val = tmp.val
+FROM (SELECT x.id, x.t, x.val FROM unnest(array[(1, '2000-01-03 00:00:00+00', 2.045)]::rescan_test[]) AS x) AS tmp
+WHERE rescan_test.id = tmp.id AND rescan_test.t = tmp.t AND rescan_test.t >= '2000-01-03';
+
+-- single row update with FROM is blocked
+\set ON_ERROR_STOP 0
+UPDATE rescan_test SET val = tmp.val
+FROM (SELECT x.id, x.t, x.val FROM unnest(array[(1, '2000-01-03 00:00:00+00', 2.045)]::rescan_test[]) AS x) AS tmp
+WHERE rescan_test.id = tmp.id AND rescan_test.t = tmp.t;
+
+-- bulk row update with FROM is blocked
+UPDATE rescan_test SET val = tmp.val
+FROM (SELECT x.id, x.t, x.val FROM unnest(array[(1, '2000-01-03 00:00:00+00', 2.045), (1, '2000-01-03 01:00:00+00', 8.045)]::rescan_test[]) AS x) AS tmp
+WHERE rescan_test.id = tmp.id AND rescan_test.t = tmp.t;
+\set ON_ERROR_STOP 1
+
+
+-- Test FK constraint drop and recreate during compression and decompression on a chunk
+
+CREATE TABLE meta (device_id INT PRIMARY KEY);
+CREATE TABLE hyper(
+    time INT NOT NULL,
+    device_id INT REFERENCES meta(device_id) ON DELETE CASCADE ON UPDATE CASCADE,
+    val INT);
+SELECT * FROM create_hypertable('hyper', 'time', chunk_time_interval => 10);
+ALTER TABLE hyper SET (
+    timescaledb.compress,
+    timescaledb.compress_orderby = 'time',
+    timescaledb.compress_segmentby = 'device_id');
+INSERT INTO meta VALUES (1), (2), (3), (4), (5);
+INSERT INTO hyper VALUES (1, 1, 1), (2, 2, 1), (3, 3, 1), (10, 3, 2), (11, 4, 2), (11, 5, 2);
+
+SELECT ch1.table_name AS "CHUNK_NAME", ch1.schema_name|| '.' || ch1.table_name AS "CHUNK_FULL_NAME"
+FROM _timescaledb_catalog.chunk ch1, _timescaledb_catalog.hypertable ht
+WHERE ch1.hypertable_id = ht.id AND ht.table_name LIKE 'hyper'
+ORDER BY ch1.id LIMIT 1 \gset
+
+SELECT constraint_schema, constraint_name, table_schema, table_name, constraint_type
+FROM information_schema.table_constraints
+WHERE table_name = :'CHUNK_NAME' AND constraint_type = 'FOREIGN KEY'
+ORDER BY constraint_name;
+
+SELECT compress_chunk(:'CHUNK_FULL_NAME');
+
+SELECT constraint_schema, constraint_name, table_schema, table_name, constraint_type
+FROM information_schema.table_constraints
+WHERE table_name = :'CHUNK_NAME' AND constraint_type = 'FOREIGN KEY'
+ORDER BY constraint_name;
+
+-- Delete data from compressed chunk directly fails
+\set ON_ERROR_STOP 0
+DELETE FROM hyper WHERE device_id = 3;
+\set ON_ERROR_STOP 0
+
+-- Delete data from FK-referenced table deletes data from compressed chunk
+SELECT * FROM hyper ORDER BY time, device_id;
+DELETE FROM meta WHERE device_id = 3;
+SELECT * FROM hyper ORDER BY time, device_id;
+
+SELECT decompress_chunk(:'CHUNK_FULL_NAME');
+
+SELECT constraint_schema, constraint_name, table_schema, table_name, constraint_type
+FROM information_schema.table_constraints
+WHERE table_name = :'CHUNK_NAME' AND constraint_type = 'FOREIGN KEY'
+ORDER BY constraint_name;
+
+-- create hypertable with 2 chunks
+CREATE TABLE ht5(time TIMESTAMPTZ NOT NULL);
+SELECT create_hypertable('ht5','time');
+INSERT INTO ht5 SELECT '2000-01-01'::TIMESTAMPTZ;
+INSERT INTO ht5 SELECT '2001-01-01'::TIMESTAMPTZ;
+
+-- compressed_chunk_stats should not show dropped chunks
+ALTER TABLE ht5 SET (timescaledb.compress);
+SELECT compress_chunk(i) FROM show_chunks('ht5') i;
+SELECT drop_chunks(table_name => 'ht5', newer_than => '2000-01-01'::TIMESTAMPTZ);
+SELECT chunk_name
+FROM timescaledb_information.compressed_chunk_stats
+WHERE hypertable_name = 'ht5'::regclass;

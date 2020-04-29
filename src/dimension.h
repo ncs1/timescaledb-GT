@@ -9,6 +9,7 @@
 #include <postgres.h>
 #include <access/attnum.h>
 #include <access/htup_details.h>
+#include <executor/tuptable.h>
 #include <catalog/pg_type.h>
 
 #include "catalog.h"
@@ -124,8 +125,7 @@ enum Anum_add_dimension
 extern Hyperspace *ts_dimension_scan(int32 hypertable_id, Oid main_table_relid, int16 num_dimension,
 									 MemoryContext mctx);
 extern DimensionSlice *ts_dimension_calculate_default_slice(Dimension *dim, int64 value);
-extern TSDLLEXPORT Point *ts_hyperspace_calculate_point(Hyperspace *h, HeapTuple tuple,
-														TupleDesc tupdesc);
+extern TSDLLEXPORT Point *ts_hyperspace_calculate_point(Hyperspace *h, TupleTableSlot *slot);
 extern Dimension *ts_hyperspace_get_dimension_by_id(Hyperspace *hs, int32 id);
 extern TSDLLEXPORT Dimension *ts_hyperspace_get_dimension(Hyperspace *hs, DimensionType type,
 														  Index n);
@@ -137,8 +137,8 @@ extern int ts_dimension_set_type(Dimension *dim, Oid newtype);
 extern TSDLLEXPORT Oid ts_dimension_get_partition_type(Dimension *dim);
 extern int ts_dimension_set_name(Dimension *dim, const char *newname);
 extern int ts_dimension_set_chunk_interval(Dimension *dim, int64 chunk_interval);
-extern Datum ts_dimension_transform_value(Dimension *dim, Datum value, Oid const_datum_type,
-										  Oid *restype);
+extern Datum ts_dimension_transform_value(Dimension *dim, Oid collation, Datum value,
+										  Oid const_datum_type, Oid *restype);
 extern int ts_dimension_delete_by_hypertable_id(int32 hypertable_id, bool delete_slices);
 extern TSDLLEXPORT void ts_dimension_open_typecheck(Oid arg_type, Oid time_column_type,
 													const char *caller_name);

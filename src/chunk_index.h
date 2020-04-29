@@ -12,7 +12,8 @@
 #include <fmgr.h>
 #include <utils/relcache.h>
 
-#include <export.h>
+#include "compat.h"
+#include "export.h"
 
 typedef struct Chunk Chunk;
 typedef struct Hypertable Hypertable;
@@ -39,7 +40,7 @@ extern TSDLLEXPORT void ts_chunk_index_create_all(int32 hypertable_id, Oid hyper
 												  int32 chunk_id, Oid chunkrelid);
 extern Oid ts_chunk_index_create_from_stmt(IndexStmt *stmt, int32 chunk_id, Oid chunkrelid,
 										   int32 hypertable_id, Oid hypertable_indexrelid);
-extern int ts_chunk_index_delete(Chunk *chunk, Oid chunk_indexrelid, bool drop_index);
+extern int ts_chunk_index_delete(int32 chunk_id, const char *indexname, bool drop_index);
 extern int ts_chunk_index_delete_by_chunk_id(int32 chunk_id, bool drop_index);
 extern void ts_chunk_index_delete_by_name(const char *schema, const char *index_name,
 										  bool drop_index);
@@ -92,13 +93,14 @@ chunk_index_columns_changed(int hypertable_natts, bool hypertable_has_oid, Tuple
 	 * attributes differ is because we have removed columns in the base table,
 	 * leaving junk attributes that aren't inherited by the chunk.
 	 */
-	return !(hypertable_natts == chunkdesc->natts && hypertable_has_oid == chunkdesc->tdhasoid);
+	return !(hypertable_natts == chunkdesc->natts &&
+			 hypertable_has_oid == TUPLE_DESC_HAS_OIDS(chunkdesc));
 }
 
 static inline bool
 chunk_index_need_attnos_adjustment(TupleDesc htdesc, TupleDesc chunkdesc)
 {
-	return chunk_index_columns_changed(htdesc->natts, htdesc->tdhasoid, chunkdesc);
+	return chunk_index_columns_changed(htdesc->natts, TUPLE_DESC_HAS_OIDS(htdesc), chunkdesc);
 }
 
 #endif /* TIMESCALEDB_CHUNK_INDEX_H */

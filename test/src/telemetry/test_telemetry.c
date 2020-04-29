@@ -28,6 +28,7 @@ TS_FUNCTION_INFO_V1(ts_test_status_ssl);
 TS_FUNCTION_INFO_V1(ts_test_status_mock);
 TS_FUNCTION_INFO_V1(ts_test_telemetry_main_conn);
 TS_FUNCTION_INFO_V1(ts_test_telemetry);
+TS_FUNCTION_INFO_V1(ts_test_check_version_response);
 
 #ifdef TS_DEBUG
 static char *test_string;
@@ -156,6 +157,27 @@ ts_test_validate_server_version(PG_FUNCTION_ARGS)
 		PG_RETURN_TEXT_P(cstring_to_text(result.versionstr));
 
 	PG_RETURN_NULL();
+}
+
+Datum
+ts_test_check_version_response(PG_FUNCTION_ARGS)
+{
+	text *response = PG_GETARG_TEXT_P(0);
+	const char *volatile json = text_to_cstring(response);
+	PG_TRY();
+	{
+		ts_check_version_response(json);
+	}
+	PG_CATCH();
+	{
+		/* If the response is malformed, ts_check_version_response() will
+		 * throw an error, so we capture the error here. The error message
+		 * contains the function pointer, which will vary between test runs,
+		 * so we do not re-throw the error here and instead print our own. */
+		ereport(ERROR, (errmsg("malformed telemetry response body")));
+	}
+	PG_END_TRY();
+	PG_RETURN_VOID();
 }
 
 /* Try to get the telemetry function to handle errors. Never connect to the

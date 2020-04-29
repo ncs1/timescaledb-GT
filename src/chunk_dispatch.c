@@ -4,12 +4,14 @@
  * LICENSE-APACHE for a copy of the license.
  */
 #include <postgres.h>
+#include <nodes/nodes.h>
 #include <nodes/extensible.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
 #include <utils/rel.h>
 #include <catalog/pg_type.h>
 
+#include "compat.h"
 #include "chunk_dispatch.h"
 #include "chunk_insert_state.h"
 #include "subspace_store.h"
@@ -24,15 +26,73 @@ ts_chunk_dispatch_create(Hypertable *ht, EState *estate)
 	cd->hypertable = ht;
 	cd->estate = estate;
 	cd->hypertable_result_rel_info = NULL;
-	cd->on_conflict = ONCONFLICT_NONE;
-	cd->arbiter_indexes = NIL;
-	cd->cmd_type = CMD_INSERT;
 	cd->cache =
 		ts_subspace_store_init(ht->space, estate->es_query_cxt, ts_guc_max_open_chunks_per_insert);
 	cd->prev_cis = NULL;
 	cd->prev_cis_oid = InvalidOid;
 
 	return cd;
+}
+
+static inline ModifyTableState *
+get_modifytable_state(const ChunkDispatch *dispatch)
+{
+	return dispatch->dispatch_state->mtstate;
+}
+
+static inline ModifyTable *
+get_modifytable(const ChunkDispatch *dispatch)
+{
+	return castNode(ModifyTable, get_modifytable_state(dispatch)->ps.plan);
+}
+
+bool
+ts_chunk_dispatch_has_returning(const ChunkDispatch *dispatch)
+{
+	if (NULL == dispatch->dispatch_state)
+		return false;
+	return get_modifytable(dispatch)->returningLists != NIL;
+}
+
+List *
+ts_chunk_dispatch_get_returning_clauses(const ChunkDispatch *dispatch)
+{
+	ModifyTableState *mtstate = dispatch->dispatch_state->mtstate;
+
+	return list_nth(get_modifytable(dispatch)->returningLists, mtstate->mt_whichplan);
+}
+
+List *
+ts_chunk_dispatch_get_arbiter_indexes(const ChunkDispatch *dispatch)
+{
+	return dispatch->dispatch_state->arbiter_indexes;
+}
+
+OnConflictAction
+ts_chunk_dispatch_get_on_conflict_action(const ChunkDispatch *dispatch)
+{
+	if (NULL == dispatch->dispatch_state)
+		return ONCONFLICT_NONE;
+	return get_modifytable(dispatch)->onConflictAction;
+}
+
+List *
+ts_chunk_dispatch_get_on_conflict_set(const ChunkDispatch *dispatch)
+{
+	return get_modifytable(dispatch)->onConflictSet;
+}
+
+Node *
+ts_chunk_dispatch_get_on_conflict_where(const ChunkDispatch *dispatch)
+{
+	return get_modifytable(dispatch)->onConflictWhere;
+}
+
+CmdType
+ts_chunk_dispatch_get_cmd_type(const ChunkDispatch *dispatch)
+{
+	return dispatch->dispatch_state == NULL ? CMD_INSERT :
+											  dispatch->dispatch_state->mtstate->operation;
 }
 
 void
@@ -53,13 +113,12 @@ destroy_chunk_insert_state(void *cis)
  */
 extern ChunkInsertState *
 ts_chunk_dispatch_get_chunk_insert_state(ChunkDispatch *dispatch, Point *point,
-										 bool *cis_changed_out)
+										 on_chunk_changed_func on_chunk_changed, void *data)
 {
 	ChunkInsertState *cis;
+	bool cis_changed = true;
 
-	Assert(cis_changed_out != NULL);
 	cis = ts_subspace_store_get(dispatch->cache, point);
-	*cis_changed_out = true;
 
 	if (NULL == cis)
 	{
@@ -76,11 +135,11 @@ ts_chunk_dispatch_get_chunk_insert_state(ChunkDispatch *dispatch, Point *point,
 	else if (cis->rel->rd_id == dispatch->prev_cis_oid && cis == dispatch->prev_cis)
 	{
 		/* got the same item from cache as before */
-		*cis_changed_out = false;
+		cis_changed = false;
 	}
 
-	if (*cis_changed_out)
-		ts_chunk_insert_state_switch(cis);
+	if (cis_changed && on_chunk_changed)
+		on_chunk_changed(cis, data);
 
 	Assert(cis != NULL);
 	dispatch->prev_cis = cis;

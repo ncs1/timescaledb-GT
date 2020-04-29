@@ -4,9 +4,6 @@
  * LICENSE-TIMESCALE for a copy of the license.
  */
 #include <postgres.h>
-
-#include "compression/gorilla.h"
-
 #include <access/htup_details.h>
 #include <catalog/pg_type.h>
 #include <funcapi.h>
@@ -15,20 +12,16 @@
 #include <utils/memutils.h>
 
 #include "compat.h"
-#include "export.h"
-
-#include <utils.h>
-#include "utils.h"
-
-#include <adts/bit_array.h>
-#include <base64_compat.h>
-
-#include "compression/compression.h"
-#include "compression/simple8b_rle.h"
-
-#if !(PG10 || PG96 || PG11)
+#if PG12_GE
 #include <port/pg_bitutils.h>
 #endif
+
+#include "compression/gorilla.h"
+#include "utils.h"
+#include "adts/bit_array.h"
+#include "base64_compat.h"
+#include "compression/compression.h"
+#include "compression/simple8b_rle.h"
 
 /*
  * Gorilla compressed data is stored as
@@ -127,6 +120,7 @@ typedef struct GorillaDecompressionIterator
  *****  UTILS  *****
  ********************/
 
+#if PG12_LT
 #ifndef pg_leftmost_one_pos64
 static inline int
 pg_leftmost_one_pos64(uint64 word)
@@ -205,7 +199,7 @@ pg_rightmost_one_pos64(uint64 word)
 #endif /* HAVE__BUILTIN_CTZ */
 }
 #endif
-
+#endif /* PG12_LT */
 /********************
  ***  Compressor  ***
  ********************/
@@ -333,6 +327,7 @@ gorilla_compressor_for_type(Oid element_type)
 		default:
 			elog(ERROR, "invalid type for Gorilla compression %d", element_type);
 	}
+	pg_unreachable();
 }
 
 GorillaCompressor *
@@ -658,6 +653,7 @@ convert_from_internal(DecompressResultInternal res_internal, Oid element_type)
 		default:
 			elog(ERROR, "invalid type requested from gorilla decompression");
 	}
+	pg_unreachable();
 }
 
 static DecompressResultInternal

@@ -11,11 +11,17 @@
 #include <optimizer/clauses.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/paths.h>
-#include <optimizer/planner.h>
 #include <optimizer/tlist.h>
-#include <optimizer/var.h>
 #include <utils/lsyscache.h>
 #include <parser/parse_func.h>
+
+#include "compat.h"
+#if PG12_LT
+#include <optimizer/planner.h>
+#include <optimizer/var.h>
+#else
+#include <optimizer/optimizer.h>
+#endif
 
 #include "license.h"
 #include "nodes/gapfill/gapfill.h"

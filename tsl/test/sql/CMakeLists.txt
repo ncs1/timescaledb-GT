@@ -3,9 +3,7 @@ set(TEST_FILES
   continuous_aggs_watermark.sql
   edition.sql
   gapfill.sql
-  move.sql
   partialize_finalize.sql
-  reorder.sql
 )
 
 set(TEST_FILES_DEBUG
@@ -14,6 +12,7 @@ set(TEST_FILES_DEBUG
   continuous_aggs.sql
   continuous_aggs_bgw.sql
   continuous_aggs_bgw_drop_chunks.sql
+  continuous_aggs_ddl.sql
   continuous_aggs_dump.sql
   continuous_aggs_materialize.sql
   continuous_aggs_multi.sql
@@ -24,18 +23,28 @@ set(TEST_FILES_DEBUG
 
 set(TEST_TEMPLATES
   continuous_aggs_permissions.sql.in
+  continuous_aggs_union_view.sql.in
+  move.sql.in
   plan_gapfill.sql.in
+  reorder.sql.in
 )
+
+# Check if PostgreSQL was compiled with JIT support
+set(PG_CONFIG_H "${PG_INCLUDEDIR}/pg_config.h")
+if (EXISTS ${PG_CONFIG_H})
+  file(STRINGS "${PG_CONFIG_H}" PG_USE_LLVM
+       REGEX "^#[\t ]*define[\t ]+USE_LLVM[\t ]+1.*")
+  if (PG_USE_LLVM AND ((${PG_VERSION_MAJOR} EQUAL "11") OR (${PG_VERSION_MAJOR} GREATER "11")))
+    list(APPEND TEST_TEMPLATES jit.sql.in)
+  endif()
+endif()
 
 if (CMAKE_BUILD_TYPE MATCHES Debug)
   list(APPEND TEST_TEMPLATES
-    # parallel plans are different between postgres versions
-    continuous_aggs_ddl.sql.in
     #current_timestamp_mock available only in debug mode
     continuous_aggs_query.sql.in
     )
 endif(CMAKE_BUILD_TYPE MATCHES Debug)
-
 
 #compression only for PG > 9
 if (${PG_VERSION_MAJOR} GREATER "9")
@@ -61,7 +70,14 @@ if (${PG_VERSION_MAJOR} GREATER "9")
       transparent_decompression.sql.in
       )
   endif(CMAKE_BUILD_TYPE MATCHES Debug)
-endif ()
+
+  if (${PG_VERSION_MAJOR} LESS "12")
+    list(APPEND TEST_FILES_DEBUG
+      compression_with_oids.sql
+    )
+  endif()
+
+endif()
 
 if (CMAKE_BUILD_TYPE MATCHES Debug)
   list(APPEND TEST_FILES ${TEST_FILES_DEBUG})
@@ -88,4 +104,3 @@ foreach(TEST_FILE ${TEST_FILES})
   string(REGEX REPLACE "(.+)\.sql" "\\1" TESTS_TO_RUN ${TEST_FILE})
   file(APPEND ${TEST_SCHEDULE} "test: ${TESTS_TO_RUN}\n")
 endforeach(TEST_FILE)
-

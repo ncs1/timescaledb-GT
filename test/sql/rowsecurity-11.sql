@@ -393,9 +393,9 @@ INSERT INTO hyper_document VALUES (1, 55, 1, 'regress_rls_dave', 'testing RLS wi
 -- But this should succeed.
 INSERT INTO _timescaledb_internal._hyper_2_9_chunk VALUES (1, 55, 1, 'regress_rls_dave', 'testing RLS with hypertables'); -- success
 -- We still cannot see the row using the parent
-SELECT * FROM hyper_document WHERE f_leak(dtitle) ORDER BY did;
+SELECT * FROM hyper_document WHERE f_leak(dtitle) ORDER BY did, cid;
 -- But we can if we look directly
-SELECT * FROM _timescaledb_internal._hyper_2_9_chunk WHERE f_leak(dtitle) ORDER BY did;
+SELECT * FROM _timescaledb_internal._hyper_2_9_chunk WHERE f_leak(dtitle) ORDER BY did, cid;
 
 -- Turn on RLS and create policy on child to show RLS is checked before constraints
 SET SESSION AUTHORIZATION regress_rls_alice;
@@ -406,15 +406,15 @@ CREATE POLICY pp3 ON _timescaledb_internal._hyper_2_9_chunk AS RESTRICTIVE
 SET SESSION AUTHORIZATION regress_rls_dave;
 INSERT INTO _timescaledb_internal._hyper_2_9_chunk VALUES (1, 55, 1, 'regress_rls_dave', 'testing RLS with hypertables - round 2'); -- fail
 -- And now we cannot see directly into the partition either, due to RLS
-SELECT * FROM _timescaledb_internal._hyper_2_9_chunk WHERE f_leak(dtitle) ORDER BY did;
+SELECT * FROM _timescaledb_internal._hyper_2_9_chunk WHERE f_leak(dtitle) ORDER BY did, cid;
 -- The parent looks same as before
 -- viewpoint from regress_rls_dave
-SELECT * FROM hyper_document WHERE f_leak(dtitle) ORDER BY did;
+SELECT * FROM hyper_document WHERE f_leak(dtitle) ORDER BY did, cid;
 EXPLAIN (COSTS OFF) SELECT * FROM hyper_document WHERE f_leak(dtitle);
 
 -- viewpoint from regress_rls_carol
 SET SESSION AUTHORIZATION regress_rls_carol;
-SELECT * FROM hyper_document WHERE f_leak(dtitle) ORDER BY did;
+SELECT * FROM hyper_document WHERE f_leak(dtitle) ORDER BY did, cid;
 EXPLAIN (COSTS OFF) SELECT * FROM hyper_document WHERE f_leak(dtitle);
 
 -- only owner can change policies
@@ -426,37 +426,37 @@ ALTER POLICY pp1 ON hyper_document USING (dauthor = current_user);
 
 -- viewpoint from regress_rls_bob again
 SET SESSION AUTHORIZATION regress_rls_bob;
-SELECT * FROM hyper_document WHERE f_leak(dtitle) ORDER BY did;
+SELECT * FROM hyper_document WHERE f_leak(dtitle) ORDER BY did, cid;
 
 -- viewpoint from rls_regres_carol again
 SET SESSION AUTHORIZATION regress_rls_carol;
-SELECT * FROM hyper_document WHERE f_leak(dtitle) ORDER BY did;
+SELECT * FROM hyper_document WHERE f_leak(dtitle) ORDER BY did, cid;
 
 EXPLAIN (COSTS OFF) SELECT * FROM hyper_document WHERE f_leak(dtitle);
 
 -- database superuser does bypass RLS policy when enabled
 RESET SESSION AUTHORIZATION;
 SET row_security TO ON;
-SELECT * FROM hyper_document ORDER BY did;
-SELECT * FROM _timescaledb_internal._hyper_2_9_chunk ORDER by did;
+SELECT * FROM hyper_document ORDER BY did, cid;
+SELECT * FROM _timescaledb_internal._hyper_2_9_chunk ORDER BY did, cid;
 
 -- database non-superuser with bypass privilege can bypass RLS policy when disabled
 SET SESSION AUTHORIZATION regress_rls_exempt_user;
 SET row_security TO OFF;
-SELECT * FROM hyper_document ORDER BY did;
-SELECT * FROM _timescaledb_internal._hyper_2_9_chunk ORDER by did;
+SELECT * FROM hyper_document ORDER BY did, cid;
+SELECT * FROM _timescaledb_internal._hyper_2_9_chunk ORDER BY did, cid;
 
 -- RLS policy does not apply to table owner when RLS enabled.
 SET SESSION AUTHORIZATION regress_rls_alice;
 SET row_security TO ON;
-SELECT * FROM hyper_document ORDER by did;
-SELECT * FROM _timescaledb_internal._hyper_2_9_chunk ORDER by did;
+SELECT * FROM hyper_document ORDER BY did, cid;
+SELECT * FROM _timescaledb_internal._hyper_2_9_chunk ORDER BY did, cid;
 
 -- When RLS disabled, other users get ERROR.
 SET SESSION AUTHORIZATION regress_rls_dave;
 SET row_security TO OFF;
-SELECT * FROM hyper_document ORDER by did;
-SELECT * FROM _timescaledb_internal._hyper_2_9_chunk ORDER by did;
+SELECT * FROM hyper_document ORDER BY did, cid;
+SELECT * FROM _timescaledb_internal._hyper_2_9_chunk ORDER BY did, cid;
 
 -- Check behavior with a policy that uses a SubPlan not an InitPlan.
 SET SESSION AUTHORIZATION regress_rls_alice;

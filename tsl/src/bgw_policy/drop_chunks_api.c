@@ -61,7 +61,7 @@ validate_drop_chunks_hypertable(Cache *hcache, Oid user_htoid, Oid older_than_ty
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot add drop chunks policy to compresed hypertable \"%s\"",
+					 errmsg("cannot add drop chunks policy to compressed hypertable \"%s\"",
 							get_rel_name(user_htoid)),
 					 errhint("Please add the policy to the corresponding uncompressed hypertable "
 							 "instead.")));
@@ -104,7 +104,7 @@ validate_drop_chunks_hypertable(Cache *hcache, Oid user_htoid, Oid older_than_ty
 		partitioning_type = ts_dimension_get_partition_type(open_dim);
 		if (IS_INTEGER_TYPE(partitioning_type))
 		{
-			open_dim = ts_continous_agg_find_integer_now_func_by_materialization_id(mat_id);
+			open_dim = ts_continuous_agg_find_integer_now_func_by_materialization_id(mat_id);
 		}
 		older_than = ts_interval_from_sql_input_internal(open_dim,
 														 older_than_datum,
@@ -139,7 +139,10 @@ drop_chunks_add_policy(PG_FUNCTION_ARGS)
 	FormData_ts_interval *older_than;
 	DropChunksMeta meta;
 	Oid mapped_oid;
-	ts_hypertable_permissions_check(ht_oid, GetUserId());
+	Oid owner_id = ts_hypertable_permissions_check(ht_oid, GetUserId());
+
+	/* Verify that the hypertable owner can create a background worker */
+	ts_bgw_job_validate_job_owner(owner_id, JOB_TYPE_DROP_CHUNKS);
 
 	/* Make sure that an existing policy doesn't exist on this hypertable */
 	hcache = ts_hypertable_cache_pin();
@@ -210,14 +213,42 @@ drop_chunks_add_policy(PG_FUNCTION_ARGS)
 Datum
 drop_chunks_remove_policy(PG_FUNCTION_ARGS)
 {
-	Oid hypertable_oid = PG_GETARG_OID(0);
+	Oid table_oid = PG_GETARG_OID(0);
 	bool if_exists = PG_GETARG_BOOL(1);
+	Cache *hcache;
+
+	Hypertable *hypertable = ts_hypertable_cache_get_cache_and_entry(table_oid, true, &hcache);
+	if (!hypertable)
+	{
+		char *view_name = get_rel_name(table_oid);
+		if (!view_name)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("OID %d does not refer to a hypertable or continuous aggregate",
+							table_oid)));
+		}
+		else
+		{
+			char *schema_name = get_namespace_name(get_rel_namespace(table_oid));
+			ContinuousAgg *ca = ts_continuous_agg_find_by_view_name(schema_name, view_name);
+			if (!ca)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("no hypertable or continuous aggregate by the name \"%s\" exists",
+								view_name)));
+			hypertable = ts_hypertable_get_by_id(ca->data.mat_hypertable_id);
+		}
+	}
+
+	Assert(hypertable != NULL);
 
 	/* Remove the job, then remove the policy */
-	int ht_id = ts_hypertable_relid_to_id(hypertable_oid);
-	BgwPolicyDropChunks *policy = ts_bgw_policy_drop_chunks_find_by_hypertable(ht_id);
+	BgwPolicyDropChunks *policy = ts_bgw_policy_drop_chunks_find_by_hypertable(hypertable->fd.id);
 
-	ts_hypertable_permissions_check(hypertable_oid, GetUserId());
+	ts_cache_release(hcache);
+
+	ts_hypertable_permissions_check(table_oid, GetUserId());
 
 	if (policy == NULL)
 	{
@@ -229,7 +260,7 @@ drop_chunks_remove_policy(PG_FUNCTION_ARGS)
 		{
 			ereport(NOTICE,
 					(errmsg("drop chunks policy does not exist on hypertable \"%s\", skipping",
-							get_rel_name(hypertable_oid))));
+							get_rel_name(table_oid))));
 			PG_RETURN_NULL();
 		}
 	}
